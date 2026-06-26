@@ -116,6 +116,8 @@ const uint32_t _PyUop_Flags[MAX_UOP_ID+1] = {
     [_BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT] = HAS_EXIT_FLAG,
     [_GUARD_NOS_FLOAT] = HAS_EXIT_FLAG,
     [_GUARD_TOS_FLOAT] = HAS_EXIT_FLAG,
+    [_EXT_BINARY_EXEC] = HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
+    [_EXT_CALL_EXEC] = HAS_ARG_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
     [_BINARY_OP_MULTIPLY_FLOAT] = HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_PURE_FLAG,
     [_BINARY_OP_ADD_FLOAT] = HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_PURE_FLAG,
     [_BINARY_OP_SUBTRACT_FLOAT] = HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_PURE_FLAG,
@@ -1176,6 +1178,24 @@ const _PyUopCachingInfo _PyUop_Caching[MAX_UOP_ID+1] = {
             { 1, 1, _GUARD_TOS_FLOAT_r11 },
             { 2, 2, _GUARD_TOS_FLOAT_r22 },
             { 3, 3, _GUARD_TOS_FLOAT_r33 },
+        },
+    },
+    [_EXT_BINARY_EXEC] = {
+        .best = { 2, 2, 2, 2 },
+        .entries = {
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+            { 3, 2, _EXT_BINARY_EXEC_r23 },
+            { -1, -1, -1 },
+        },
+    },
+    [_EXT_CALL_EXEC] = {
+        .best = { 0, 0, 0, 0 },
+        .entries = {
+            { 1, 0, _EXT_CALL_EXEC_r01 },
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+            { -1, -1, -1 },
         },
     },
     [_BINARY_OP_MULTIPLY_FLOAT] = {
@@ -4188,6 +4208,8 @@ const uint16_t _PyUop_Uncached[MAX_UOP_REGS_ID+1] = {
     [_GUARD_TOS_FLOAT_r11] = _GUARD_TOS_FLOAT,
     [_GUARD_TOS_FLOAT_r22] = _GUARD_TOS_FLOAT,
     [_GUARD_TOS_FLOAT_r33] = _GUARD_TOS_FLOAT,
+    [_EXT_BINARY_EXEC_r23] = _EXT_BINARY_EXEC,
+    [_EXT_CALL_EXEC_r01] = _EXT_CALL_EXEC,
     [_BINARY_OP_MULTIPLY_FLOAT_r03] = _BINARY_OP_MULTIPLY_FLOAT,
     [_BINARY_OP_MULTIPLY_FLOAT_r13] = _BINARY_OP_MULTIPLY_FLOAT,
     [_BINARY_OP_MULTIPLY_FLOAT_r23] = _BINARY_OP_MULTIPLY_FLOAT,
@@ -5244,6 +5266,10 @@ const char *const _PyOpcode_uop_name[MAX_UOP_REGS_ID+1] = {
     [_EXPAND_METHOD_r00] = "_EXPAND_METHOD_r00",
     [_EXPAND_METHOD_KW] = "_EXPAND_METHOD_KW",
     [_EXPAND_METHOD_KW_r11] = "_EXPAND_METHOD_KW_r11",
+    [_EXT_BINARY_EXEC] = "_EXT_BINARY_EXEC",
+    [_EXT_BINARY_EXEC_r23] = "_EXT_BINARY_EXEC_r23",
+    [_EXT_CALL_EXEC] = "_EXT_CALL_EXEC",
+    [_EXT_CALL_EXEC_r01] = "_EXT_CALL_EXEC_r01",
     [_FATAL_ERROR] = "_FATAL_ERROR",
     [_FATAL_ERROR_r00] = "_FATAL_ERROR_r00",
     [_FATAL_ERROR_r11] = "_FATAL_ERROR_r11",
@@ -6386,6 +6412,10 @@ int _PyUop_num_popped(int opcode, int oparg)
             return 0;
         case _GUARD_TOS_FLOAT:
             return 0;
+        case _EXT_BINARY_EXEC:
+            return 2;
+        case _EXT_CALL_EXEC:
+            return 2 + oparg;
         case _BINARY_OP_MULTIPLY_FLOAT:
             return 2;
         case _BINARY_OP_ADD_FLOAT:

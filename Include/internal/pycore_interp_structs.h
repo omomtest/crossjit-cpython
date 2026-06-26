@@ -924,6 +924,10 @@ struct _is {
     unsigned long feature_flags;
 
     PyObject *dict;  /* Stores per-interpreter state */
+    PyObject *jit_binary_provider_registry;
+    PyMutex jit_binary_provider_registry_mutex;
+    PyObject *jit_callable_provider_registry;
+    PyMutex jit_callable_provider_registry_mutex;
 
     PyObject *sysdict_copy;
     PyObject *builtins_copy;

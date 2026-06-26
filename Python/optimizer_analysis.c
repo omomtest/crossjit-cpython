@@ -669,6 +669,8 @@ optimize_uops(
         return 0;
     }
 
+    _Py_uop_opt_transfer_ext_plans(ctx);
+
     /* Either reached the end or cannot optimize further, but there
      * would be no benefit in retrying later */
     _Py_uop_abstractcontext_fini(ctx);

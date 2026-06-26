@@ -131,6 +131,7 @@ __pragma(warning(disable: 4201))
 #include "compile.h"
 #include "pythonrun.h"
 #include "pylifecycle.h"
+#include "cpython/jit.h"
 #include "ceval.h"
 #include "sysmodule.h"
 #include "audit.h"

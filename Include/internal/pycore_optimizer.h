@@ -95,6 +95,10 @@ typedef struct _JitOptContext {
     JitOptRef stack_array[ABSTRACT_INTERP_STACK_SIZE];
     _PyJitUopBuffer out_buffer;
     _PyBloomFilter *dependencies;
+
+    PyJitExtPlan **owned_ext_plans;
+    Py_ssize_t owned_ext_plan_count;
+    Py_ssize_t owned_ext_plan_capacity;
 } JitOptContext;
 
 
@@ -197,6 +201,8 @@ typedef struct _PyExecutorObject {
     _PyVMData vm_data; /* Used by the VM, but opaque to the optimizer */
     uint32_t exit_count;
     uint32_t code_size;
+    Py_ssize_t ext_plan_count;
+    PyJitExtPlan **ext_plans;
     size_t jit_size;
     void *jit_code;
     _PyJitCodeRegistration *jit_registration;
@@ -209,6 +215,7 @@ PyAPI_FUNC(_PyExecutorObject*) _Py_GetExecutor(PyCodeObject *code, int offset);
 int _Py_ExecutorInit(_PyExecutorObject *, const _PyBloomFilter *);
 void _Py_ExecutorDetach(_PyExecutorObject *);
 PyAPI_FUNC(void) _Py_Executor_DependsOn(_PyExecutorObject *executor, void *obj);
+void _Py_Executor_RecordExtMiss(_PyExecutorObject *executor, PyJitExtPlan *plan);
 
 /* We use a bloomfilter with k = 6, m = 256
  * The choice of k and the following constants
@@ -474,6 +481,9 @@ extern PyCodeObject *_Py_uop_sym_get_probable_func_code(JitOptRef sym);
 extern PyObject *_Py_uop_sym_get_probable_value(JitOptRef sym);
 extern PyTypeObject *_Py_uop_sym_get_probable_type(JitOptRef sym);
 extern JitOptRef *_Py_uop_sym_set_stack_depth(JitOptContext *ctx, int stack_depth, JitOptRef *current_sp);
+
+extern int _Py_uop_opt_own_ext_plan(JitOptContext *ctx, PyJitExtPlan *plan);
+extern void _Py_uop_opt_transfer_ext_plans(JitOptContext *ctx);
 
 extern void _Py_uop_abstractcontext_init(JitOptContext *ctx, _PyBloomFilter *dependencies);
 extern void _Py_uop_abstractcontext_fini(JitOptContext *ctx);

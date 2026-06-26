@@ -1442,6 +1442,61 @@ _Py_uop_sym_set_stack_depth(JitOptContext *ctx, int stack_depth, JitOptRef *curr
 }
 
 
+static void
+free_ext_plan(PyJitExtPlan *plan)
+{
+    if (plan != NULL && plan->provider != NULL &&
+        plan->provider->free_plan != NULL) {
+        plan->provider->free_plan(plan);
+    }
+}
+
+int
+_Py_uop_opt_own_ext_plan(JitOptContext *ctx, PyJitExtPlan *plan)
+{
+    for (Py_ssize_t i = 0; i < ctx->owned_ext_plan_count; i++) {
+        if (ctx->owned_ext_plans[i] == plan) {
+            return 0;
+        }
+    }
+    if (ctx->owned_ext_plan_count == ctx->owned_ext_plan_capacity) {
+        Py_ssize_t capacity = ctx->owned_ext_plan_capacity == 0 ? 4 :
+                              ctx->owned_ext_plan_capacity * 2;
+        PyJitExtPlan **items = PyMem_Realloc(
+            ctx->owned_ext_plans, capacity * sizeof(*items));
+        if (items == NULL) {
+            return -1;
+        }
+        ctx->owned_ext_plans = items;
+        ctx->owned_ext_plan_capacity = capacity;
+    }
+    ctx->owned_ext_plans[ctx->owned_ext_plan_count++] = plan;
+    return 0;
+}
+
+void
+_Py_uop_opt_transfer_ext_plans(JitOptContext *ctx)
+{
+    for (Py_ssize_t i = 0; i < ctx->owned_ext_plan_count; i++) {
+        PyJitExtPlan *plan = ctx->owned_ext_plans[i];
+        bool emitted = false;
+        for (_PyUOpInstruction *op = ctx->out_buffer.start;
+             op < ctx->out_buffer.next; op++) {
+            if ((PyJitExtPlan *)(uintptr_t)op->operand0 == plan) {
+                emitted = true;
+                break;
+            }
+        }
+        if (!emitted) {
+            free_ext_plan(plan);
+        }
+    }
+    PyMem_Free(ctx->owned_ext_plans);
+    ctx->owned_ext_plans = NULL;
+    ctx->owned_ext_plan_count = 0;
+    ctx->owned_ext_plan_capacity = 0;
+}
+
 void
 _Py_uop_abstractcontext_fini(JitOptContext *ctx)
 {
@@ -1449,6 +1504,13 @@ _Py_uop_abstractcontext_fini(JitOptContext *ctx)
         return;
     }
     ctx->curr_frame_depth = 0;
+    for (Py_ssize_t i = 0; i < ctx->owned_ext_plan_count; i++) {
+        free_ext_plan(ctx->owned_ext_plans[i]);
+    }
+    PyMem_Free(ctx->owned_ext_plans);
+    ctx->owned_ext_plans = NULL;
+    ctx->owned_ext_plan_count = 0;
+    ctx->owned_ext_plan_capacity = 0;
     int tys = ctx->t_arena.ty_curr_number;
     for (int i = 0; i < tys; i++) {
         JitOptSymbol *sym = &ctx->t_arena.arena[i];
@@ -1493,6 +1555,9 @@ _Py_uop_abstractcontext_init(JitOptContext *ctx, _PyBloomFilter *dependencies)
     ctx->out_of_space = false;
     ctx->contradiction = false;
     ctx->builtins_watched = false;
+    ctx->owned_ext_plans = NULL;
+    ctx->owned_ext_plan_count = 0;
+    ctx->owned_ext_plan_capacity = 0;
     ctx->dependencies = dependencies;
 }
 

@@ -918,6 +918,32 @@
             break;
         }
 
+        case _EXT_BINARY_EXEC: {
+            JitOptRef res;
+            JitOptRef l;
+            JitOptRef r;
+            res = sym_new_not_null(ctx);
+            l = sym_new_not_null(ctx);
+            r = sym_new_not_null(ctx);
+            CHECK_STACK_BOUNDS(1);
+            stack_pointer[-2] = res;
+            stack_pointer[-1] = l;
+            stack_pointer[0] = r;
+            stack_pointer += 1;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
+        case _EXT_CALL_EXEC: {
+            JitOptRef res;
+            res = sym_new_not_null(ctx);
+            CHECK_STACK_BOUNDS(-1 - oparg);
+            stack_pointer[-2 - oparg] = res;
+            stack_pointer += -1 - oparg;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
         case _BINARY_OP_MULTIPLY_FLOAT: {
             JitOptRef right;
             JitOptRef left;
@@ -4147,7 +4173,44 @@
         }
 
         case _CALL_NON_PY_GENERAL: {
+            JitOptRef self_or_null;
+            JitOptRef callable;
             JitOptRef res;
+            self_or_null = stack_pointer[-1 - oparg];
+            callable = stack_pointer[-2 - oparg];
+            if (sym_is_null(self_or_null)) {
+                PyObject *callable_o = sym_get_const(ctx, callable);
+                if (callable_o != NULL) {
+                    PyJitExtProvider *provider = PyJit_LookupCallableProvider(callable_o);
+                    if (provider != NULL) {
+                        PyJitExtTraceRequest request = {
+                            .kind = PYJIT_EXT_TRACE_CALL,
+                            .u.call = {
+                                .callable = callable_o,
+                                .nargs = oparg,
+                                .call_flags = 0,
+                                .kwnames = NULL,
+                            },
+                        };
+                        PyJitExtPlan *plan = provider->try_plan(&request, NULL);
+                        if (plan != NULL) {
+                            if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                                if (plan->provider != NULL &&
+                                    plan->provider->free_plan != NULL) {
+                                    plan->provider->free_plan(plan);
+                                }
+                                ctx->done = true;
+                            }
+                            else {
+                                ADD_OP(_EXT_CALL_EXEC, oparg, (uintptr_t)plan);
+                            }
+                        }
+                        else if (PyErr_Occurred()) {
+                            ctx->done = true;
+                        }
+                    }
+                }
+            }
             res = sym_new_not_null(ctx);
             CHECK_STACK_BOUNDS(-1 - oparg);
             stack_pointer[-2 - oparg] = res;
@@ -5296,120 +5359,173 @@
             lhs = stack_pointer[-2];
             l = lhs;
             r = rhs;
-            if (
-                sym_is_safe_const(ctx, lhs) &&
-                sym_is_safe_const(ctx, rhs)
-            ) {
-                JitOptRef lhs_sym = lhs;
-                JitOptRef rhs_sym = rhs;
-                _PyStackRef lhs = sym_get_const_as_stackref(ctx, lhs_sym);
-                _PyStackRef rhs = sym_get_const_as_stackref(ctx, rhs_sym);
-                _PyStackRef res_stackref;
-                _PyStackRef l_stackref;
-                _PyStackRef r_stackref;
-                /* Start of uop copied from bytecodes for constant evaluation */
-                PyObject *lhs_o = PyStackRef_AsPyObjectBorrow(lhs);
-                PyObject *rhs_o = PyStackRef_AsPyObjectBorrow(rhs);
-                assert(_PyEval_BinaryOps[oparg]);
-                PyObject *res_o = _PyEval_BinaryOps[oparg](lhs_o, rhs_o);
-                if (res_o == NULL) {
-                    JUMP_TO_LABEL(error);
+            res = sym_new_unknown(ctx);
+            bool handled = false;
+            {
+                PyTypeObject *left_type = sym_get_type(lhs);
+                if (left_type == NULL) {
+                    left_type = sym_get_probable_type(lhs);
                 }
-                res_stackref = PyStackRef_FromPyObjectSteal(res_o);
-                l_stackref = lhs;
-                r_stackref = rhs;
-                /* End of uop copied from bytecodes for constant evaluation */
-                (void)l_stackref;
-                (void)r_stackref;
-                res = sym_new_const_steal(ctx, PyStackRef_AsPyObjectSteal(res_stackref));
-                if (sym_is_const(ctx, res)) {
-                    PyObject *result = sym_get_const(ctx, res);
-                    if (_Py_IsImmortal(result)) {
-                        // Replace with _LOAD_CONST_INLINE_BORROW + _RROT_3 since we have two inputs and an immortal result
-                        ADD_OP(_LOAD_CONST_INLINE_BORROW, 0, (uintptr_t)result);
-                        ADD_OP(_RROT_3, 0, 0);
+                PyTypeObject *right_type = sym_get_type(rhs);
+                if (right_type == NULL) {
+                    right_type = sym_get_probable_type(rhs);
+                }
+                if (left_type != NULL && right_type != NULL) {
+                    CHECK_STACK_BOUNDS(1);
+                    stack_pointer[-2] = res;
+                    stack_pointer[-1] = l;
+                    stack_pointer[0] = r;
+                    stack_pointer += 1;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    PyJitExtProvider *provider = PyJit_LookupBinaryProvider(
+                        left_type, right_type, oparg);
+                    if (provider != NULL) {
+                        PyJitExtTraceRequest request = {
+                            .kind = PYJIT_EXT_TRACE_BINARY,
+                            .u.binary = {
+                                .binary_oparg = oparg,
+                                .left_type = left_type,
+                                .right_type = right_type,
+                            },
+                        };
+                        PyJitExtPlan *plan = provider->try_plan(&request, NULL);
+                        if (plan != NULL) {
+                            if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                                if (plan->provider != NULL &&
+                                    plan->provider->free_plan != NULL) {
+                                    plan->provider->free_plan(plan);
+                                }
+                                ctx->done = true;
+                                handled = true;
+                                break;
+                            }
+                            ADD_OP(_EXT_BINARY_EXEC, 0, (uintptr_t)plan);
+                            if (
+                                sym_is_safe_const(ctx, lhs) &&
+                                sym_is_safe_const(ctx, rhs)
+                            ) {
+                                JitOptRef lhs_sym = lhs;
+                                JitOptRef rhs_sym = rhs;
+                                _PyStackRef lhs = sym_get_const_as_stackref(ctx, lhs_sym);
+                                _PyStackRef rhs = sym_get_const_as_stackref(ctx, rhs_sym);
+                                _PyStackRef res_stackref;
+                                _PyStackRef l_stackref;
+                                _PyStackRef r_stackref;
+                                /* Start of uop copied from bytecodes for constant evaluation */
+                                PyObject *lhs_o = PyStackRef_AsPyObjectBorrow(lhs);
+                                PyObject *rhs_o = PyStackRef_AsPyObjectBorrow(rhs);
+                                assert(_PyEval_BinaryOps[oparg]);
+                                PyObject *res_o = _PyEval_BinaryOps[oparg](lhs_o, rhs_o);
+                                if (res_o == NULL) {
+                                    JUMP_TO_LABEL(error);
+                                }
+                                res_stackref = PyStackRef_FromPyObjectSteal(res_o);
+                                l_stackref = lhs;
+                                r_stackref = rhs;
+                                /* End of uop copied from bytecodes for constant evaluation */
+                                (void)l_stackref;
+                                (void)r_stackref;
+                                res = sym_new_const_steal(ctx, PyStackRef_AsPyObjectSteal(res_stackref));
+                                if (sym_is_const(ctx, res)) {
+                                    PyObject *result = sym_get_const(ctx, res);
+                                    if (_Py_IsImmortal(result)) {
+                                        // Replace with _LOAD_CONST_INLINE_BORROW + _RROT_3 since we have two inputs and an immortal result
+                                        ADD_OP(_LOAD_CONST_INLINE_BORROW, 0, (uintptr_t)result);
+                                        ADD_OP(_RROT_3, 0, 0);
+                                    }
+                                }
+                                CHECK_STACK_BOUNDS(1);
+                                stack_pointer[-2] = res;
+                                stack_pointer[-1] = l;
+                                stack_pointer[0] = r;
+                                stack_pointer += 1;
+                                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                                break;
+                            }
+                            handled = true;
+                        }
+                        else if (PyErr_Occurred()) {
+                            ctx->done = true;
+                            handled = true;
+                        }
+                    }
+                    stack_pointer += -1;
+                }
+            }
+            if (!handled) {
+                bool lhs_int = sym_matches_type(lhs, &PyLong_Type);
+                bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
+                bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
+                bool rhs_float = sym_matches_type(rhs, &PyFloat_Type);
+                bool is_truediv = (oparg == NB_TRUE_DIVIDE
+                               || oparg == NB_INPLACE_TRUE_DIVIDE);
+                bool is_remainder = (oparg == NB_REMAINDER
+                                 || oparg == NB_INPLACE_REMAINDER);
+                int emit_op = _BINARY_OP;
+                if (is_truediv || is_remainder) {
+                    if (!sym_has_type(rhs)
+                        && sym_get_probable_type(rhs) == &PyFloat_Type) {
+                        ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
+                        sym_set_type(rhs, &PyFloat_Type);
+                        rhs_float = true;
+                    }
+                    if (!sym_has_type(lhs)
+                        && sym_get_probable_type(lhs) == &PyFloat_Type) {
+                        ADD_OP(_GUARD_NOS_FLOAT, 0, 0);
+                        sym_set_type(lhs, &PyFloat_Type);
+                        lhs_float = true;
                     }
                 }
-                CHECK_STACK_BOUNDS(1);
-                stack_pointer[-2] = res;
-                stack_pointer[-1] = l;
-                stack_pointer[0] = r;
-                stack_pointer += 1;
-                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-                break;
-            }
-            bool lhs_int = sym_matches_type(lhs, &PyLong_Type);
-            bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
-            bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
-            bool rhs_float = sym_matches_type(rhs, &PyFloat_Type);
-            bool is_truediv = (oparg == NB_TRUE_DIVIDE
-                           || oparg == NB_INPLACE_TRUE_DIVIDE);
-            bool is_remainder = (oparg == NB_REMAINDER
-                             || oparg == NB_INPLACE_REMAINDER);
-            int emit_op = _BINARY_OP;
-            if (is_truediv || is_remainder) {
-                if (!sym_has_type(rhs)
-                    && sym_get_probable_type(rhs) == &PyFloat_Type) {
-                    ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
-                    sym_set_type(rhs, &PyFloat_Type);
-                    rhs_float = true;
-                }
-                if (!sym_has_type(lhs)
-                    && sym_get_probable_type(lhs) == &PyFloat_Type) {
-                    ADD_OP(_GUARD_NOS_FLOAT, 0, 0);
-                    sym_set_type(lhs, &PyFloat_Type);
-                    lhs_float = true;
-                }
-            }
-            if (is_truediv && lhs_float && rhs_float) {
-                if (PyJitRef_IsUnique(lhs)) {
-                    emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
-                    l = sym_new_null(ctx);
-                    r = rhs;
-                }
-                else if (PyJitRef_IsUnique(rhs)) {
-                    emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
-                    l = lhs;
-                    r = sym_new_null(ctx);
-                }
-                else {
-                    emit_op = _BINARY_OP_TRUEDIV_FLOAT;
-                    l = lhs;
-                    r = rhs;
-                }
-                res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
-            }
-            else if (is_truediv
-                 && (lhs_int || lhs_float) && (rhs_int || rhs_float)) {
-                res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
-            }
-            else if (!((lhs_int || lhs_float) && (rhs_int || rhs_float))) {
-                res = sym_new_unknown(ctx);
-            }
-            else if (oparg == NB_POWER || oparg == NB_INPLACE_POWER) {
-                if (rhs_float) {
-                    res = sym_new_unknown(ctx);
-                }
-                else if (lhs_float) {
+                if (is_truediv && lhs_float && rhs_float) {
+                    if (PyJitRef_IsUnique(lhs)) {
+                        emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
+                        l = sym_new_null(ctx);
+                        r = rhs;
+                    }
+                    else if (PyJitRef_IsUnique(rhs)) {
+                        emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
+                        l = lhs;
+                        r = sym_new_null(ctx);
+                    }
+                    else {
+                        emit_op = _BINARY_OP_TRUEDIV_FLOAT;
+                        l = lhs;
+                        r = rhs;
+                    }
                     res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
                 }
-                else if (!sym_is_const(ctx, rhs)) {
-                    res = sym_new_unknown(ctx);
-                }
-                else if (_PyLong_IsNegative((PyLongObject *)sym_get_const(ctx, rhs))) {
+                else if (is_truediv
+                     && (lhs_int || lhs_float) && (rhs_int || rhs_float)) {
                     res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
                 }
-                else {
+                else if (!((lhs_int || lhs_float) && (rhs_int || rhs_float))) {
+                    res = sym_new_unknown(ctx);
+                }
+                else if (oparg == NB_POWER || oparg == NB_INPLACE_POWER) {
+                    if (rhs_float) {
+                        res = sym_new_unknown(ctx);
+                    }
+                    else if (lhs_float) {
+                        res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+                    }
+                    else if (!sym_is_const(ctx, rhs)) {
+                        res = sym_new_unknown(ctx);
+                    }
+                    else if (_PyLong_IsNegative((PyLongObject *)sym_get_const(ctx, rhs))) {
+                        res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+                    }
+                    else {
+                        res = sym_new_type(ctx, &PyLong_Type);
+                    }
+                }
+                else if (lhs_int && rhs_int) {
                     res = sym_new_type(ctx, &PyLong_Type);
                 }
+                else {
+                    res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+                }
+                ADD_OP(emit_op, oparg, 0);
             }
-            else if (lhs_int && rhs_int) {
-                res = sym_new_type(ctx, &PyLong_Type);
-            }
-            else {
-                res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
-            }
-            ADD_OP(emit_op, oparg, 0);
             CHECK_STACK_BOUNDS(1);
             stack_pointer[-2] = res;
             stack_pointer[-1] = l;

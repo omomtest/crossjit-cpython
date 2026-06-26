@@ -321,6 +321,8 @@ _Py_COMP_DIAG_POP
         &(runtime)->_main_interpreter.types.mutex, \
         &(runtime)->_main_interpreter.code_state.mutex, \
         &(runtime)->_main_interpreter.dict_state.watcher_mutex, \
+        &(runtime)->_main_interpreter.jit_binary_provider_registry_mutex, \
+        &(runtime)->_main_interpreter.jit_callable_provider_registry_mutex, \
     }
 
 static void
@@ -858,6 +860,8 @@ interpreter_clear(PyInterpreterState *interp, PyThreadState *tstate)
     Py_CLEAR(interp->sysdict_copy);
     Py_CLEAR(interp->builtins_copy);
     Py_CLEAR(interp->dict);
+    Py_CLEAR(interp->jit_binary_provider_registry);
+    Py_CLEAR(interp->jit_callable_provider_registry);
 #ifdef HAVE_FORK
     Py_CLEAR(interp->before_forkers);
     Py_CLEAR(interp->after_forkers_parent);

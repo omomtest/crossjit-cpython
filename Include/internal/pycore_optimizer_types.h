@@ -29,6 +29,9 @@ extern "C" {
 /* Symbols */
 /* See explanation in optimizer_symbols.c */
 
+/* Per-symbol flags stored in the second byte of every JitOptSymbol variant.
+   Accessible uniformly via sym->flags (anonymous struct member). */
+
 
 typedef enum _JitSymType {
     JIT_SYM_UNKNOWN_TAG = 1,
@@ -49,22 +52,26 @@ typedef enum _JitSymType {
 
 typedef struct _jit_opt_known_class {
     uint8_t tag;
+    uint8_t flags;
     uint32_t version;
     PyTypeObject *type;
 } JitOptKnownClass;
 
 typedef struct _jit_opt_known_version {
     uint8_t tag;
+    uint8_t flags;
     uint32_t version;
 } JitOptKnownVersion;
 
 typedef struct _jit_opt_known_func_version {
     uint8_t tag;
+    uint8_t flags;
     uint32_t func_version;
 } JitOptKnownFuncVersion;
 
 typedef struct _jit_opt_known_value {
     uint8_t tag;
+    uint8_t flags;
     PyObject *value;
 } JitOptKnownValue;
 
@@ -72,12 +79,14 @@ typedef struct _jit_opt_known_value {
 
 typedef struct _jit_opt_tuple {
     uint8_t tag;
+    uint8_t flags;
     uint8_t length;
     uint16_t items[MAX_SYMBOLIC_TUPLE_SIZE];
 } JitOptTuple;
 
 typedef struct {
     uint8_t tag;
+    uint8_t flags;
     bool invert;
     uint16_t value;
 } JitOptTruthiness;
@@ -91,6 +100,7 @@ typedef enum {
 
 typedef struct {
     uint8_t tag;
+    uint8_t flags;
     uint8_t kind;
     uint16_t lhs;
     uint16_t rhs;
@@ -98,12 +108,14 @@ typedef struct {
 
 typedef struct _jit_opt_recorded_value {
     uint8_t tag;
+    uint8_t flags;
     bool known_type;
     PyObject *value;
 } JitOptRecordedValue;
 
 typedef struct _jit_opt_recorded_type {
     uint8_t tag;
+    uint8_t flags;
     PyTypeObject *type;
 } JitOptRecordedType;
 
@@ -111,15 +123,17 @@ typedef struct _jit_opt_recorded_type {
  * function as the generator is emphemeral */
 typedef struct _jit_opt_recorded_gen_func {
     uint8_t tag;
+    uint8_t flags;
     PyFunctionObject *func;
 } JitOptRecordedGenFunc;
 
 typedef struct {
     uint8_t tag;
+    uint8_t flags;
 } JitOptCompactInt;
 
 typedef union _jit_opt_symbol {
-    uint8_t tag;
+    struct { uint8_t tag; uint8_t flags; };
     JitOptKnownClass cls;
     JitOptKnownValue value;
     JitOptKnownVersion version;

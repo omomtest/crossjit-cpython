@@ -38,6 +38,269 @@
 // We start with _START_EXECUTOR, _MAKE_WARM
 #define CODE_SIZE_EMPTY 2
 
+#define PYJIT_EXT_PROVIDER_CAPSULE "PyJitExtProvider"
+
+static PyObject *
+jit_binary_provider_registry_get(PyInterpreterState *interp, int create)
+{
+    if (!create) {
+        return interp->jit_binary_provider_registry;
+    }
+    if (interp->jit_binary_provider_registry != NULL) {
+        return interp->jit_binary_provider_registry;
+    }
+    PyMutex_Lock(&interp->jit_binary_provider_registry_mutex);
+    if (interp->jit_binary_provider_registry == NULL) {
+        interp->jit_binary_provider_registry = PyDict_New();
+    }
+    PyMutex_Unlock(&interp->jit_binary_provider_registry_mutex);
+    return interp->jit_binary_provider_registry;
+}
+
+static PyObject *
+jit_callable_provider_registry_get(PyInterpreterState *interp, int create)
+{
+    if (!create) {
+        return interp->jit_callable_provider_registry;
+    }
+    if (interp->jit_callable_provider_registry != NULL) {
+        return interp->jit_callable_provider_registry;
+    }
+    PyMutex_Lock(&interp->jit_callable_provider_registry_mutex);
+    if (interp->jit_callable_provider_registry == NULL) {
+        interp->jit_callable_provider_registry = PyDict_New();
+    }
+    PyMutex_Unlock(&interp->jit_callable_provider_registry_mutex);
+    return interp->jit_callable_provider_registry;
+}
+
+static PyObject *
+jit_binary_provider_key(PyTypeObject *left_type, PyTypeObject *right_type,
+                        int binary_oparg)
+{
+    PyObject *left = PyLong_FromVoidPtr(left_type);
+    if (left == NULL) {
+        return NULL;
+    }
+    PyObject *right = PyLong_FromVoidPtr(right_type);
+    if (right == NULL) {
+        Py_DECREF(left);
+        return NULL;
+    }
+    PyObject *oparg = PyLong_FromLong(binary_oparg);
+    if (oparg == NULL) {
+        Py_DECREF(left);
+        Py_DECREF(right);
+        return NULL;
+    }
+    PyObject *key = PyTuple_Pack(3, left, right, oparg);
+    Py_DECREF(left);
+    Py_DECREF(right);
+    Py_DECREF(oparg);
+    return key;
+}
+
+static int
+jit_provider_check(PyJitExtProvider *provider)
+{
+    if (provider == NULL || provider->try_plan == NULL ||
+        provider->free_plan == NULL) {
+        PyErr_SetString(PyExc_ValueError,
+                        "provider, try_plan, and free_plan must be non-NULL");
+        return -1;
+    }
+    if (provider->abi_version != PYJIT_EXT_ABI_VERSION ||
+        provider->struct_size < sizeof(PyJitExtProvider)) {
+        PyErr_SetString(PyExc_ValueError,
+                        "unsupported JIT extension provider ABI");
+        return -1;
+    }
+    return 0;
+}
+
+static PyObject *
+jit_provider_capsule(PyJitExtProvider *provider)
+{
+    return PyCapsule_New(provider, PYJIT_EXT_PROVIDER_CAPSULE, NULL);
+}
+
+static PyJitExtProvider *
+jit_provider_from_capsule(PyObject *capsule)
+{
+    PyJitExtProvider *provider = PyCapsule_GetPointer(
+        capsule, PYJIT_EXT_PROVIDER_CAPSULE);
+    if (provider == NULL) {
+        PyErr_Clear();
+    }
+    return provider;
+}
+
+PyAPI_FUNC(int)
+PyJit_RegisterBinaryProvider(PyTypeObject *left_type,
+                             PyTypeObject *right_type,
+                             int binary_oparg,
+                             PyJitExtProvider *provider)
+{
+    if (left_type == NULL || right_type == NULL) {
+        PyErr_SetString(PyExc_ValueError, "types must be non-NULL");
+        return -1;
+    }
+    if (!PyType_Check((PyObject *)left_type) ||
+        !PyType_Check((PyObject *)right_type)) {
+        PyErr_SetString(PyExc_TypeError, "types must be PyTypeObject instances");
+        return -1;
+    }
+    if (jit_provider_check(provider) < 0) {
+        return -1;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "no current thread state");
+        return -1;
+    }
+    PyObject *registry = jit_binary_provider_registry_get(tstate->interp, 1);
+    PyObject *key = jit_binary_provider_key(left_type, right_type, binary_oparg);
+    PyObject *capsule = jit_provider_capsule(provider);
+    if (registry == NULL || key == NULL || capsule == NULL) {
+        Py_XDECREF(key);
+        Py_XDECREF(capsule);
+        return -1;
+    }
+    int result = PyDict_SetItem(registry, key, capsule);
+    Py_DECREF(key);
+    Py_DECREF(capsule);
+    return result;
+}
+
+PyAPI_FUNC(int)
+PyJit_UnregisterBinaryProvider(PyTypeObject *left_type,
+                               PyTypeObject *right_type,
+                               int binary_oparg)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "no current thread state");
+        return -1;
+    }
+    PyObject *registry = jit_binary_provider_registry_get(tstate->interp, 0);
+    if (registry == NULL) {
+        return 0;
+    }
+    PyObject *key = jit_binary_provider_key(left_type, right_type, binary_oparg);
+    if (key == NULL) {
+        return -1;
+    }
+    int result = PyDict_DelItem(registry, key);
+    Py_DECREF(key);
+    if (result < 0 && PyErr_ExceptionMatches(PyExc_KeyError)) {
+        PyErr_Clear();
+        return 0;
+    }
+    return result;
+}
+
+PyAPI_FUNC(PyJitExtProvider *)
+PyJit_LookupBinaryProvider(PyTypeObject *left_type,
+                           PyTypeObject *right_type,
+                           int binary_oparg)
+{
+    if (left_type == NULL || right_type == NULL) {
+        return NULL;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return NULL;
+    }
+    PyObject *registry = jit_binary_provider_registry_get(tstate->interp, 0);
+    if (registry == NULL) {
+        return NULL;
+    }
+    PyObject *key = jit_binary_provider_key(left_type, right_type, binary_oparg);
+    if (key == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject *capsule = PyDict_GetItemWithError(registry, key);
+    Py_DECREF(key);
+    if (capsule == NULL) {
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+        }
+        return NULL;
+    }
+    return jit_provider_from_capsule(capsule);
+}
+
+PyAPI_FUNC(int)
+PyJit_RegisterCallableProvider(PyObject *callable, PyJitExtProvider *provider)
+{
+    if (callable == NULL || !PyCallable_Check(callable)) {
+        PyErr_SetString(PyExc_TypeError, "callable must be callable");
+        return -1;
+    }
+    if (jit_provider_check(provider) < 0) {
+        return -1;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "no current thread state");
+        return -1;
+    }
+    PyObject *registry = jit_callable_provider_registry_get(tstate->interp, 1);
+    PyObject *capsule = jit_provider_capsule(provider);
+    if (registry == NULL || capsule == NULL) {
+        Py_XDECREF(capsule);
+        return -1;
+    }
+    int result = PyDict_SetItem(registry, callable, capsule);
+    Py_DECREF(capsule);
+    return result;
+}
+
+PyAPI_FUNC(int)
+PyJit_UnregisterCallableProvider(PyObject *callable)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "no current thread state");
+        return -1;
+    }
+    PyObject *registry = jit_callable_provider_registry_get(tstate->interp, 0);
+    if (registry == NULL) {
+        return 0;
+    }
+    int result = PyDict_DelItem(registry, callable);
+    if (result < 0 && PyErr_ExceptionMatches(PyExc_KeyError)) {
+        PyErr_Clear();
+        return 0;
+    }
+    return result;
+}
+
+PyAPI_FUNC(PyJitExtProvider *)
+PyJit_LookupCallableProvider(PyObject *callable)
+{
+    if (callable == NULL) {
+        return NULL;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return NULL;
+    }
+    PyObject *registry = jit_callable_provider_registry_get(tstate->interp, 0);
+    if (registry == NULL) {
+        return NULL;
+    }
+    PyObject *capsule = PyDict_GetItemWithError(registry, callable);
+    if (capsule == NULL) {
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+        }
+        return NULL;
+    }
+    return jit_provider_from_capsule(capsule);
+}
+
 #define _PyExecutorObject_CAST(op)  ((_PyExecutorObject *)(op))
 
 #ifndef Py_GIL_DISABLED
@@ -254,6 +517,18 @@ static int executor_clear(PyObject *executor);
 void
 _PyExecutor_Free(_PyExecutorObject *self)
 {
+    if (self->ext_plans != NULL) {
+        for (Py_ssize_t i = 0; i < self->ext_plan_count; i++) {
+            PyJitExtPlan *plan = self->ext_plans[i];
+            if (plan != NULL && plan->provider != NULL &&
+                plan->provider->free_plan != NULL) {
+                plan->provider->free_plan(plan);
+            }
+        }
+        PyMem_Free(self->ext_plans);
+        self->ext_plans = NULL;
+        self->ext_plan_count = 0;
+    }
 #ifdef _Py_JIT
     _PyJIT_Free(self);
 #endif
@@ -1457,6 +1732,8 @@ allocate_executor(int exit_count, int length)
     res->trace = (_PyUOpInstruction *)(res->exits + exit_count);
     res->code_size = length;
     res->exit_count = exit_count;
+    res->ext_plan_count = 0;
+    res->ext_plans = NULL;
     res->jit_registration = NULL;
     return res;
 }
@@ -1529,6 +1806,52 @@ sanity_check(_PyExecutorObject *executor)
 #undef CHECK
 #endif
 
+static PyJitExtPlan *
+ext_plan_from_uop(const _PyUOpInstruction *instruction)
+{
+    uint16_t opcode = _PyUop_Uncached[instruction->opcode];
+    if (opcode == _EXT_BINARY_EXEC ||
+        opcode == _EXT_CALL_EXEC) {
+        return (PyJitExtPlan *)(uintptr_t)instruction->operand0;
+    }
+    return NULL;
+}
+
+static bool
+ext_plan_seen_earlier(_PyUOpInstruction *buffer, int index,
+                      PyJitExtPlan *plan)
+{
+    for (int i = 0; i < index; i++) {
+        if (ext_plan_from_uop(&buffer[i]) == plan) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static Py_ssize_t
+ext_plan_index(_PyExecutorObject *executor, PyJitExtPlan *plan)
+{
+    for (Py_ssize_t i = 0; i < executor->ext_plan_count; i++) {
+        if (executor->ext_plans[i] == plan) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void
+free_ext_plans_from_uops(_PyUOpInstruction *buffer, int length)
+{
+    for (int i = 0; i < length; i++) {
+        PyJitExtPlan *plan = ext_plan_from_uop(&buffer[i]);
+        if (plan != NULL && !ext_plan_seen_earlier(buffer, i, plan) &&
+            plan->provider != NULL && plan->provider->free_plan != NULL) {
+            plan->provider->free_plan(plan);
+        }
+    }
+}
+
 /* Makes an executor from a buffer of uops.
  * Account for the buffer having gaps and NOPs by computing a "used"
  * bit vector and only copying the used uops. Here "used" means reachable
@@ -1540,7 +1863,43 @@ make_executor_from_uops(_PyThreadStateImpl *tstate, _PyUOpInstruction *buffer, i
     int exit_count = count_exits(buffer, length);
     _PyExecutorObject *executor = allocate_executor(exit_count, length);
     if (executor == NULL) {
+        free_ext_plans_from_uops(buffer, length);
         return NULL;
+    }
+
+    Py_ssize_t ext_count = 0;
+    for (int i = 0; i < length; i++) {
+        PyJitExtPlan *plan = ext_plan_from_uop(&buffer[i]);
+        if (plan != NULL && !ext_plan_seen_earlier(buffer, i, plan)) {
+            ext_count++;
+        }
+    }
+    if (ext_count != 0) {
+        executor->ext_plans = PyMem_Malloc(
+            ext_count * sizeof(*executor->ext_plans));
+        if (executor->ext_plans == NULL) {
+            free_ext_plans_from_uops(buffer, length);
+            Py_DECREF(executor);
+            return NULL;
+        }
+        Py_ssize_t next = 0;
+        for (int i = 0; i < length; i++) {
+            PyJitExtPlan *plan = ext_plan_from_uop(&buffer[i]);
+            if (plan != NULL && !ext_plan_seen_earlier(buffer, i, plan)) {
+                executor->ext_plans[next++] = plan;
+            }
+        }
+        assert(next == ext_count);
+        executor->ext_plan_count = ext_count;
+
+        for (int i = 0; i < length; i++) {
+            PyJitExtPlan *plan = ext_plan_from_uop(&buffer[i]);
+            if (plan != NULL) {
+                Py_ssize_t plan_index = ext_plan_index(executor, plan);
+                assert(plan_index >= 0);
+                buffer[i].operand0 = (uint64_t)plan_index;
+            }
+        }
     }
 
     /* Initialize exits */
@@ -1917,6 +2276,15 @@ executor_invalidate(PyObject *op)
     executor_clear_exits(executor);
     _Py_ExecutorDetach(executor);
     _PyObject_GC_UNTRACK(op);
+}
+
+void
+_Py_Executor_RecordExtMiss(_PyExecutorObject *executor, PyJitExtPlan *plan)
+{
+    if (plan != NULL) {
+        (void)plan;
+    }
+    executor_invalidate((PyObject *)executor);
 }
 
 static int

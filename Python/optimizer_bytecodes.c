@@ -3,7 +3,7 @@
 #include "pycore_opcode_utils.h"
 #include "pycore_optimizer.h"
 #include "pycore_typeobject.h"
-#include "pycore_uops.h"
+#include "pycore_uop.h"
 #include "pycore_uop_ids.h"
 #include "internal/pycore_moduleobject.h"
 
@@ -280,106 +280,156 @@ dummy_func(void) {
     op(_BINARY_OP, (lhs, rhs -- res, l, r)) {
         l = lhs;
         r = rhs;
-        REPLACE_OPCODE_IF_EVALUATES_PURE(lhs, rhs, res);
-        bool lhs_int = sym_matches_type(lhs, &PyLong_Type);
-        bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
-        bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
-        bool rhs_float = sym_matches_type(rhs, &PyFloat_Type);
-        bool is_truediv = (oparg == NB_TRUE_DIVIDE
-                           || oparg == NB_INPLACE_TRUE_DIVIDE);
-        bool is_remainder = (oparg == NB_REMAINDER
-                             || oparg == NB_INPLACE_REMAINDER);
-        int emit_op = _BINARY_OP;
-        // Promote probable-float operands to known floats via speculative
-        // guards. _RECORD_TOS_TYPE / _RECORD_NOS_TYPE in the BINARY_OP macro
-        // record the observed operand type during tracing, which
-        // sym_get_probable_type reads here. Applied only to ops where
-        // narrowing unlocks a meaningful downstream win:
-        //   - NB_TRUE_DIVIDE: enables the specialized float path below.
-        //   - NB_REMAINDER: lets the float result type propagate.
-        // NB_POWER is excluded: speculative guards there regressed
-        // test_power_type_depends_on_input_values (GH-127844).
-        if (is_truediv || is_remainder) {
-            if (!sym_has_type(rhs)
-                    && sym_get_probable_type(rhs) == &PyFloat_Type) {
-                ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
-                sym_set_type(rhs, &PyFloat_Type);
-                rhs_float = true;
+        /* NOTE: REPLACE_OPCODE_IF_EVALUATES_PURE must come AFTER res is
+         * initialized by sym_new_unknown(), otherwise res is uninitialized
+         * and the macro can fail, preventing JIT compilation. */
+        // REPLACE_OPCODE_IF_EVALUATES_PURE(lhs, rhs, res);
+        res = sym_new_unknown(ctx);
+        bool handled = false;
+        {
+            PyTypeObject *left_type = sym_get_type(lhs);
+            if (left_type == NULL) {
+                left_type = sym_get_probable_type(lhs);
             }
-            if (!sym_has_type(lhs)
-                    && sym_get_probable_type(lhs) == &PyFloat_Type) {
-                ADD_OP(_GUARD_NOS_FLOAT, 0, 0);
-                sym_set_type(lhs, &PyFloat_Type);
-                lhs_float = true;
+            PyTypeObject *right_type = sym_get_type(rhs);
+            if (right_type == NULL) {
+                right_type = sym_get_probable_type(rhs);
+            }
+            if (left_type != NULL && right_type != NULL) {
+                PyJitExtProvider *provider = PyJit_LookupBinaryProvider(
+                    left_type, right_type, oparg);
+                if (provider != NULL) {
+                    PyJitExtTraceRequest request = {
+                        .kind = PYJIT_EXT_TRACE_BINARY,
+                        .u.binary = {
+                            .binary_oparg = oparg,
+                            .left_type = left_type,
+                            .right_type = right_type,
+                        },
+                    };
+                    PyJitExtPlan *plan = provider->try_plan(&request, NULL);
+                    if (plan != NULL) {
+                        if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                            if (plan->provider != NULL &&
+                                plan->provider->free_plan != NULL) {
+                                plan->provider->free_plan(plan);
+                            }
+                            ctx->done = true;
+                            handled = true;
+                            break;
+                        }
+                        ADD_OP(_EXT_BINARY_EXEC, 0, (uintptr_t)plan);
+                        REPLACE_OPCODE_IF_EVALUATES_PURE(lhs, rhs, res);
+                        handled = true;
+                    }
+                    else if (PyErr_Occurred()) {
+                        ctx->done = true;
+                        handled = true;
+                    }
+                }
             }
         }
-        if (is_truediv && lhs_float && rhs_float) {
-            if (PyJitRef_IsUnique(lhs)) {
-                emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
-                l = sym_new_null(ctx);
-                r = rhs;
+        if (!handled) {
+            bool lhs_int = sym_matches_type(lhs, &PyLong_Type);
+            bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
+            bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
+            bool rhs_float = sym_matches_type(rhs, &PyFloat_Type);
+            bool is_truediv = (oparg == NB_TRUE_DIVIDE
+                               || oparg == NB_INPLACE_TRUE_DIVIDE);
+            bool is_remainder = (oparg == NB_REMAINDER
+                                 || oparg == NB_INPLACE_REMAINDER);
+            int emit_op = _BINARY_OP;
+            // Promote probable-float operands to known floats via speculative
+            // guards. _RECORD_TOS_TYPE / _RECORD_NOS_TYPE in the BINARY_OP macro
+            // record the observed operand type during tracing, which
+            // sym_get_probable_type reads here. Applied only to ops where
+            // narrowing unlocks a meaningful downstream win:
+            //   - NB_TRUE_DIVIDE: enables the specialized float path below.
+            //   - NB_REMAINDER: lets the float result type propagate.
+            // NB_POWER is excluded: speculative guards there regressed
+            // test_power_type_depends_on_input_values (GH-127844).
+            if (is_truediv || is_remainder) {
+                if (!sym_has_type(rhs)
+                        && sym_get_probable_type(rhs) == &PyFloat_Type) {
+                    ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
+                    sym_set_type(rhs, &PyFloat_Type);
+                    rhs_float = true;
+                }
+                if (!sym_has_type(lhs)
+                        && sym_get_probable_type(lhs) == &PyFloat_Type) {
+                    ADD_OP(_GUARD_NOS_FLOAT, 0, 0);
+                    sym_set_type(lhs, &PyFloat_Type);
+                    lhs_float = true;
+                }
             }
-            else if (PyJitRef_IsUnique(rhs)) {
-                emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
-                l = lhs;
-                r = sym_new_null(ctx);
-            }
-            else {
-                emit_op = _BINARY_OP_TRUEDIV_FLOAT;
-                l = lhs;
-                r = rhs;
-            }
-            res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
-        }
-        else if (is_truediv
-                && (lhs_int || lhs_float) && (rhs_int || rhs_float)) {
-            res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
-        }
-        else if (!((lhs_int || lhs_float) && (rhs_int || rhs_float))) {
-            // There's something other than an int or float involved:
-            res = sym_new_unknown(ctx);
-        }
-        else if (oparg == NB_POWER || oparg == NB_INPLACE_POWER) {
-            // This one's fun... the *type* of the result depends on the
-            // *values* being exponentiated. However, exponents with one
-            // constant part are reasonably common, so it's probably worth
-            // trying to infer some simple cases:
-            // - A: 1 ** 1 -> 1 (int ** int -> int)
-            // - B: 1 ** -1 -> 1.0 (int ** int -> float)
-            // - C: 1.0 ** 1 -> 1.0 (float ** int -> float)
-            // - D: 1 ** 1.0 -> 1.0 (int ** float -> float)
-            // - E: -1 ** 0.5 ~> 1j (int ** float -> complex)
-            // - F: 1.0 ** 1.0 -> 1.0 (float ** float -> float)
-            // - G: -1.0 ** 0.5 ~> 1j (float ** float -> complex)
-            if (rhs_float) {
-                // Case D, E, F, or G... can't know without the sign of the LHS
-                // or whether the RHS is whole, which isn't worth the effort:
-                res = sym_new_unknown(ctx);
-            }
-            else if (lhs_float) {
-                // Case C:
+            if (is_truediv && lhs_float && rhs_float) {
+                if (PyJitRef_IsUnique(lhs)) {
+                    emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
+                    l = sym_new_null(ctx);
+                    r = rhs;
+                }
+                else if (PyJitRef_IsUnique(rhs)) {
+                    emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
+                    l = lhs;
+                    r = sym_new_null(ctx);
+                }
+                else {
+                    emit_op = _BINARY_OP_TRUEDIV_FLOAT;
+                    l = lhs;
+                    r = rhs;
+                }
                 res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
             }
-            else if (!sym_is_const(ctx, rhs)) {
-                // Case A or B... can't know without the sign of the RHS:
-                res = sym_new_unknown(ctx);
-            }
-            else if (_PyLong_IsNegative((PyLongObject *)sym_get_const(ctx, rhs))) {
-                // Case B:
+            else if (is_truediv
+                    && (lhs_int || lhs_float) && (rhs_int || rhs_float)) {
                 res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
             }
-            else {
-                // Case A:
+            else if (!((lhs_int || lhs_float) && (rhs_int || rhs_float))) {
+                // There's something other than an int or float involved:
+                res = sym_new_unknown(ctx);
+            }
+            else if (oparg == NB_POWER || oparg == NB_INPLACE_POWER) {
+                // This one's fun... the *type* of the result depends on the
+                // *values* being exponentiated. However, exponents with one
+                // constant part are reasonably common, so it's probably worth
+                // trying to infer some simple cases:
+                // - A: 1 ** 1 -> 1 (int ** int -> int)
+                // - B: 1 ** -1 -> 1.0 (int ** int -> float)
+                // - C: 1.0 ** 1 -> 1.0 (float ** int -> float)
+                // - D: 1 ** 1.0 -> 1.0 (int ** float -> float)
+                // - E: -1 ** 0.5 ~> 1j (int ** float -> complex)
+                // - F: 1.0 ** 1.0 -> 1.0 (float ** float -> float)
+                // - G: -1.0 ** 0.5 ~> 1j (float ** float -> complex)
+                if (rhs_float) {
+                    // Case D, E, F, or G... can't know without the sign of the LHS
+                    // or whether the RHS is whole, which isn't worth the effort:
+                    res = sym_new_unknown(ctx);
+                }
+                else if (lhs_float) {
+                    // Case C:
+                    res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+                }
+                else if (!sym_is_const(ctx, rhs)) {
+                    // Case A or B... can't know without the sign of the RHS:
+                    res = sym_new_unknown(ctx);
+                }
+                else if (_PyLong_IsNegative((PyLongObject *)sym_get_const(ctx, rhs))) {
+                    // Case B:
+                    res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+                }
+                else {
+                    // Case A:
+                    res = sym_new_type(ctx, &PyLong_Type);
+                }
+            }
+            else if (lhs_int && rhs_int) {
                 res = sym_new_type(ctx, &PyLong_Type);
             }
+            else {
+                res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+            }
+            ADD_OP(emit_op, oparg, 0);
         }
-        else if (lhs_int && rhs_int) {
-            res = sym_new_type(ctx, &PyLong_Type);
-        }
-        else {
-            res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
-        }
-        ADD_OP(emit_op, oparg, 0);
     }
 
     op(_BINARY_OP_ADD_INT, (left, right -- res, l, r)) {
@@ -1765,6 +1815,44 @@ dummy_func(void) {
 
     op(_CALL_BUILTIN_CLASS, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
         callable = sym_new_not_null(ctx);
+    }
+
+
+    op(_CALL_NON_PY_GENERAL, (callable, self_or_null, args[oparg] -- res)) {
+        if (sym_is_null(self_or_null)) {
+            PyObject *callable_o = sym_get_const(ctx, callable);
+            if (callable_o != NULL) {
+                PyJitExtProvider *provider = PyJit_LookupCallableProvider(callable_o);
+                if (provider != NULL) {
+                    PyJitExtTraceRequest request = {
+                        .kind = PYJIT_EXT_TRACE_CALL,
+                        .u.call = {
+                            .callable = callable_o,
+                            .nargs = oparg,
+                            .call_flags = 0,
+                            .kwnames = NULL,
+                        },
+                    };
+                    PyJitExtPlan *plan = provider->try_plan(&request, NULL);
+                    if (plan != NULL) {
+                        if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                            if (plan->provider != NULL &&
+                                plan->provider->free_plan != NULL) {
+                                plan->provider->free_plan(plan);
+                            }
+                            ctx->done = true;
+                        }
+                        else {
+                            ADD_OP(_EXT_CALL_EXEC, oparg, (uintptr_t)plan);
+                        }
+                    }
+                    else if (PyErr_Occurred()) {
+                        ctx->done = true;
+                    }
+                }
+            }
+        }
+        res = sym_new_not_null(ctx);
     }
 
     op(_GUARD_CALLABLE_METHOD_DESCRIPTOR_O, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
