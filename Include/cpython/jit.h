@@ -13,7 +13,7 @@ extern "C" {
  * plan payloads and run their own guards, allocation, and kernels from eval().
  */
 
-#define PYJIT_EXT_ABI_VERSION 1u
+#define PYJIT_EXT_ABI_VERSION 2u
 
 typedef enum {
     PYJIT_EXT_HIT = 1,
@@ -129,6 +129,10 @@ typedef enum {
     PYJIT_EXT_STENCIL_VALUE_ERROR_TARGET,
     PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_HIT,
     PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_MISS,
+    PYJIT_EXT_STENCIL_VALUE_CUSTOM0,
+    PYJIT_EXT_STENCIL_VALUE_CUSTOM1,
+    PYJIT_EXT_STENCIL_VALUE_CUSTOM2,
+    PYJIT_EXT_STENCIL_VALUE_CUSTOM3,
 } PyJitExtStencilValueKind;
 
 typedef enum {
@@ -154,6 +158,10 @@ typedef struct {
     size_t data_size;
     const PyJitExtStencilHole *holes;
     size_t hole_count;
+    const void *custom0;
+    const void *custom1;
+    const void *custom2;
+    const void *custom3;
 } PyJitExtStencil;
 
 typedef const PyJitExtStencil *(*PyJitExtGetStencilFunc)(

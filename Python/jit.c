@@ -689,6 +689,7 @@ jit_ext_stencil_for_instruction(_PyExecutorObject *executor,
 
 static uintptr_t
 jit_ext_stencil_hole_value(const PyJitExtStencilHole *hole,
+                           const PyJitExtStencil *stencil,
                            const PyJitExtPlan *plan,
                            const _PyUOpInstruction *instruction,
                            const jit_state *state,
@@ -726,6 +727,14 @@ jit_ext_stencil_hole_value(const PyJitExtStencilHole *hole,
             return (uintptr_t)_PyJit_RecordExtHit;
         case PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_MISS:
             return (uintptr_t)_Py_Executor_RecordExtMiss;
+        case PYJIT_EXT_STENCIL_VALUE_CUSTOM0:
+            return (uintptr_t)stencil->custom0;
+        case PYJIT_EXT_STENCIL_VALUE_CUSTOM1:
+            return (uintptr_t)stencil->custom1;
+        case PYJIT_EXT_STENCIL_VALUE_CUSTOM2:
+            return (uintptr_t)stencil->custom2;
+        case PYJIT_EXT_STENCIL_VALUE_CUSTOM3:
+            return (uintptr_t)stencil->custom3;
         default:
             *ok = 0;
             return 0;
@@ -786,7 +795,7 @@ jit_ext_emit_stencil(unsigned char *code, unsigned char *data,
         unsigned char *loc = base + hole->offset;
         int ok = 1;
         uintptr_t value = jit_ext_stencil_hole_value(
-            hole, plan, instruction, state, instruction_index,
+            hole, stencil, plan, instruction, state, instruction_index,
             stencil->code_size, trace_length, &ok);
         if (!ok) {
             PyErr_SetString(PyExc_SystemError,
