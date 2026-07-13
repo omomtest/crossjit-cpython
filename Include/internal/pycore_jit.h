@@ -29,6 +29,7 @@ _Py_CODEUNIT *_PyJIT_Entry(
 );
 
 int _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction *trace, size_t length);
+int _PyJIT_UopHasStencil(int opcode);
 void _PyJIT_Free(_PyExecutorObject *executor);
 PyAPI_FUNC(int) _PyJIT_AddressInJitCode(PyInterpreterState *interp, uintptr_t addr);
 

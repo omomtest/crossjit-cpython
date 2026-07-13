@@ -5273,6 +5273,9 @@
                 SET_CURRENT_CACHED_VALUES(0);
                 JUMP_TO_ERROR();
             }
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            _PyJit_RecordExtHit(plan);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
             res = PyStackRef_FromPyObjectSteal(res_o);
             l = left;
             r = right;
@@ -5280,6 +5283,178 @@
             _tos_cache1 = l;
             _tos_cache0 = res;
             SET_CURRENT_CACHED_VALUES(3);
+            stack_pointer += -2;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            break;
+        }
+
+        case _EXT_FUSED_BINARY2_EXEC_r33: {
+            CHECK_CURRENT_CACHED_VALUES(3);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            _PyStackRef second_other;
+            _PyStackRef first_right;
+            _PyStackRef first_left;
+            _PyStackRef res;
+            _PyStackRef l;
+            _PyStackRef r;
+            _PyStackRef o;
+            _PyStackRef _stack_item_0 = _tos_cache0;
+            _PyStackRef _stack_item_1 = _tos_cache1;
+            _PyStackRef _stack_item_2 = _tos_cache2;
+            second_other = _stack_item_2;
+            first_right = _stack_item_1;
+            first_left = _stack_item_0;
+            uint16_t plan_index = (uint16_t)CURRENT_OPERAND0_16();
+            if (plan_index >= current_executor->ext_plan_count) {
+                UOP_STAT_INC(uopcode, miss);
+                _tos_cache2 = second_other;
+                _tos_cache1 = first_right;
+                _tos_cache0 = first_left;
+                SET_CURRENT_CACHED_VALUES(3);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            PyObject *first_left_o = PyStackRef_AsPyObjectBorrow(first_left);
+            PyObject *first_right_o = PyStackRef_AsPyObjectBorrow(first_right);
+            PyObject *second_other_o = PyStackRef_AsPyObjectBorrow(second_other);
+            if (plan == NULL || plan->kind != PYJIT_EXT_PLAN_FUSED_BINARY2 ||
+                    plan->eval.fused_binary2_eval == NULL) {
+                UOP_STAT_INC(uopcode, miss);
+                _tos_cache2 = second_other;
+                _tos_cache1 = first_right;
+                _tos_cache0 = first_left;
+                SET_CURRENT_CACHED_VALUES(3);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyObject *res_o = NULL;
+            stack_pointer[0] = first_left;
+            stack_pointer[1] = first_right;
+            stack_pointer[2] = second_other;
+            stack_pointer += 3;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            PyJitExtResult jit_res = plan->eval.fused_binary2_eval(
+                plan->payload, first_left_o, first_right_o, second_other_o,
+                &res_o);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (jit_res == PYJIT_EXT_MISS) {
+                _PyFrame_SetStackPointer(frame, stack_pointer);
+                _Py_Executor_RecordExtMiss(current_executor, plan);
+                stack_pointer = _PyFrame_GetStackPointer(frame);
+                if (true) {
+                    UOP_STAT_INC(uopcode, miss);
+                    _tos_cache2 = second_other;
+                    _tos_cache1 = first_right;
+                    _tos_cache0 = first_left;
+                    SET_CURRENT_CACHED_VALUES(3);
+                    stack_pointer += -3;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    JUMP_TO_JUMP_TARGET();
+                }
+            }
+            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_ERROR();
+            }
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            _PyJit_RecordExtHit(plan);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            res = PyStackRef_FromPyObjectSteal(res_o);
+            l = first_left;
+            r = first_right;
+            o = second_other;
+            _tos_cache2 = o;
+            _tos_cache1 = r;
+            _tos_cache0 = l;
+            SET_CURRENT_CACHED_VALUES(3);
+            stack_pointer[-3] = res;
+            stack_pointer += -2;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            break;
+        }
+
+        case _EXT_FUSED_BINARY2_RIGHT_EXEC_r33: {
+            CHECK_CURRENT_CACHED_VALUES(3);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            _PyStackRef first_right;
+            _PyStackRef first_left;
+            _PyStackRef second_other;
+            _PyStackRef res;
+            _PyStackRef o;
+            _PyStackRef l;
+            _PyStackRef r;
+            _PyStackRef _stack_item_0 = _tos_cache0;
+            _PyStackRef _stack_item_1 = _tos_cache1;
+            _PyStackRef _stack_item_2 = _tos_cache2;
+            first_right = _stack_item_2;
+            first_left = _stack_item_1;
+            second_other = _stack_item_0;
+            uint16_t plan_index = (uint16_t)CURRENT_OPERAND0_16();
+            if (plan_index >= current_executor->ext_plan_count) {
+                UOP_STAT_INC(uopcode, miss);
+                _tos_cache2 = first_right;
+                _tos_cache1 = first_left;
+                _tos_cache0 = second_other;
+                SET_CURRENT_CACHED_VALUES(3);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            PyObject *first_left_o = PyStackRef_AsPyObjectBorrow(first_left);
+            PyObject *first_right_o = PyStackRef_AsPyObjectBorrow(first_right);
+            PyObject *second_other_o = PyStackRef_AsPyObjectBorrow(second_other);
+            if (plan == NULL || plan->kind != PYJIT_EXT_PLAN_FUSED_BINARY2 ||
+                    plan->eval.fused_binary2_eval == NULL) {
+                UOP_STAT_INC(uopcode, miss);
+                _tos_cache2 = first_right;
+                _tos_cache1 = first_left;
+                _tos_cache0 = second_other;
+                SET_CURRENT_CACHED_VALUES(3);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyObject *res_o = NULL;
+            stack_pointer[0] = second_other;
+            stack_pointer[1] = first_left;
+            stack_pointer[2] = first_right;
+            stack_pointer += 3;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            PyJitExtResult jit_res = plan->eval.fused_binary2_eval(
+                plan->payload, first_left_o, first_right_o, second_other_o,
+                &res_o);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (jit_res == PYJIT_EXT_MISS) {
+                _PyFrame_SetStackPointer(frame, stack_pointer);
+                _Py_Executor_RecordExtMiss(current_executor, plan);
+                stack_pointer = _PyFrame_GetStackPointer(frame);
+                if (true) {
+                    UOP_STAT_INC(uopcode, miss);
+                    _tos_cache2 = first_right;
+                    _tos_cache1 = first_left;
+                    _tos_cache0 = second_other;
+                    SET_CURRENT_CACHED_VALUES(3);
+                    stack_pointer += -3;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    JUMP_TO_JUMP_TARGET();
+                }
+            }
+            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_ERROR();
+            }
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            _PyJit_RecordExtHit(plan);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            res = PyStackRef_FromPyObjectSteal(res_o);
+            o = second_other;
+            l = first_left;
+            r = first_right;
+            _tos_cache2 = r;
+            _tos_cache1 = l;
+            _tos_cache0 = o;
+            SET_CURRENT_CACHED_VALUES(3);
+            stack_pointer[-3] = res;
             stack_pointer += -2;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
             assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
@@ -5357,6 +5532,9 @@
                 SET_CURRENT_CACHED_VALUES(0);
                 JUMP_TO_ERROR();
             }
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            _PyJit_RecordExtHit(plan);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
             res = PyStackRef_FromPyObjectSteal(res_o);
             _tos_cache0 = res;
             _tos_cache1 = PyStackRef_ZERO_BITS;

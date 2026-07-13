@@ -19,8 +19,12 @@
 #include "pycore_uop_ids.h"
 #include "pycore_jit.h"
 #include <stdbool.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define NEED_OPCODE_METADATA
 #include "pycore_uop_metadata.h" // Uop tables
@@ -39,6 +43,87 @@
 #define CODE_SIZE_EMPTY 2
 
 #define PYJIT_EXT_PROVIDER_CAPSULE "PyJitExtProvider"
+#define PYJIT_EXT_SITE_CAPSULE "PyJitExtSiteState"
+
+static int jit_ext_site_stats_atexit_registered = 0;
+static uint32_t jit_ext_next_site_id = 0;
+static PyJitExtBinaryAdmissionEntry *jit_ext_binary_admission_detail = NULL;
+static PyMutex jit_ext_binary_admission_detail_mutex = {0};
+static PyMutex jit_ext_fusion_candidate_mutex = {0};
+
+static int
+jit_ext_stats_enabled(void)
+{
+    char *enabled = Py_GETENV("PYTHON_JIT_EXT_STATS");
+    return enabled != NULL && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+static void
+jit_ext_site_stats_atexit(void)
+{
+    PyInterpreterState *interp = _PyInterpreterState_Main();
+    _PyJit_DumpExtSiteStats(interp);
+    _PyJit_DumpExtOptimizerStats(interp);
+    _PyJit_DumpExtBinaryAdmissionStats(interp);
+}
+
+static void
+jit_ext_stats_register_atexit(void)
+{
+    if (!jit_ext_site_stats_atexit_registered && jit_ext_stats_enabled()) {
+        if (Py_AtExit(jit_ext_site_stats_atexit) == 0) {
+            jit_ext_site_stats_atexit_registered = 1;
+        }
+    }
+}
+
+int
+_PyJitExtEnableSiteDisable(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        char *value = Py_GETENV("PYTHON_JIT_EXT_ENABLE_SITE_DISABLE");
+        enabled = value == NULL || value[0] != '0';
+    }
+    return enabled;
+}
+
+int
+_PyJitExtLookupOnly(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        char *value = Py_GETENV("PYTHON_JIT_EXT_LOOKUP_ONLY");
+        enabled = value != NULL && value[0] != '\0' && value[0] != '0';
+    }
+    return enabled;
+}
+
+int
+_PyJitExtPlanNoEmit(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        char *value = Py_GETENV("PYTHON_JIT_EXT_PLAN_NO_EMIT");
+        enabled = value != NULL && value[0] != '\0' && value[0] != '0';
+    }
+    return enabled;
+}
+
+static int
+jit_ext_env_int(const char *name, int default_value)
+{
+    char *value = Py_GETENV(name);
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || parsed < 0 || parsed > INT_MAX) {
+        return default_value;
+    }
+    return (int)parsed;
+}
 
 static PyObject *
 jit_binary_provider_registry_get(PyInterpreterState *interp, int create)
@@ -57,6 +142,69 @@ jit_binary_provider_registry_get(PyInterpreterState *interp, int create)
     return interp->jit_binary_provider_registry;
 }
 
+static uint64_t
+jit_binary_provider_oparg_bit(int binary_oparg)
+{
+    if (binary_oparg < 0 || binary_oparg >= 64) {
+        return 0;
+    }
+    return (uint64_t)1 << binary_oparg;
+}
+
+bool
+_PyJit_MaybeHasBinaryProviderForOparg(int binary_oparg)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return false;
+    }
+    uint64_t bit = jit_binary_provider_oparg_bit(binary_oparg);
+    if (bit == 0) {
+        return true;
+    }
+    return (tstate->interp->jit_binary_provider_oparg_mask & bit) != 0;
+}
+
+static int
+jit_binary_provider_cache_find(PyInterpreterState *interp,
+                               PyTypeObject *left_type,
+                               PyTypeObject *right_type,
+                               int binary_oparg)
+{
+    for (uint8_t i = 0; i < interp->jit_binary_provider_cache_count; i++) {
+        if (interp->jit_binary_provider_left_types[i] == left_type &&
+            interp->jit_binary_provider_right_types[i] == right_type &&
+            interp->jit_binary_provider_opargs[i] == binary_oparg) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool
+_PyJit_MaybeHasBinaryProviderForTypesOparg(PyTypeObject *left_type,
+                                           PyTypeObject *right_type,
+                                           int binary_oparg)
+{
+    if (left_type == NULL || right_type == NULL) {
+        return false;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return false;
+    }
+    PyInterpreterState *interp = tstate->interp;
+    uint64_t bit = jit_binary_provider_oparg_bit(binary_oparg);
+    if (bit != 0 && (interp->jit_binary_provider_oparg_mask & bit) == 0) {
+        return false;
+    }
+    if (interp->jit_binary_provider_cache_overflow) {
+        return true;
+    }
+    return jit_binary_provider_cache_find(
+        interp, left_type, right_type, binary_oparg) >= 0;
+}
+
 static PyObject *
 jit_callable_provider_registry_get(PyInterpreterState *interp, int create)
 {
@@ -72,6 +220,500 @@ jit_callable_provider_registry_get(PyInterpreterState *interp, int create)
     }
     PyMutex_Unlock(&interp->jit_callable_provider_registry_mutex);
     return interp->jit_callable_provider_registry;
+}
+
+static int
+jit_callable_provider_cache_find(PyInterpreterState *interp,
+                                 PyObject *callable)
+{
+    for (uint8_t i = 0; i < interp->jit_callable_provider_cache_count; i++) {
+        if (interp->jit_callable_provider_callables[i] == callable) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool
+_PyJit_MaybeHasCallableProvider(PyObject *callable)
+{
+    if (callable == NULL) {
+        return false;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return false;
+    }
+    PyInterpreterState *interp = tstate->interp;
+    if (interp->jit_callable_provider_registry == NULL) {
+        return false;
+    }
+    if (interp->jit_callable_provider_cache_overflow) {
+        return true;
+    }
+    return jit_callable_provider_cache_find(interp, callable) >= 0;
+}
+
+static PyObject *
+jit_ext_site_registry_get(PyInterpreterState *interp, int create)
+{
+    if (!create) {
+        return interp->jit_ext_site_registry;
+    }
+    if (interp->jit_ext_site_registry != NULL) {
+        return interp->jit_ext_site_registry;
+    }
+    PyMutex_Lock(&interp->jit_ext_site_registry_mutex);
+    if (interp->jit_ext_site_registry == NULL) {
+        interp->jit_ext_site_registry = PyDict_New();
+        jit_ext_stats_register_atexit();
+    }
+    PyMutex_Unlock(&interp->jit_ext_site_registry_mutex);
+    return interp->jit_ext_site_registry;
+}
+
+void
+_PyJit_RecordExtOptimizerEvent(PyJitExtTraceKind kind,
+                               PyJitExtOptimizerEvent event)
+{
+    if (kind < PYJIT_EXT_TRACE_BINARY || kind > PYJIT_EXT_TRACE_FUSED_BINARY2 ||
+        event < 0 || event >= PYJIT_EXT_OPT_EVENT_COUNT) {
+        return;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return;
+    }
+    tstate->interp->jit_ext_optimizer_counts[kind][event]++;
+    jit_ext_stats_register_atexit();
+}
+
+void
+_PyJit_RecordExtBinaryAdmission(int binary_oparg,
+                                PyTypeObject *left_type,
+                                PyTypeObject *right_type,
+                                PyJitExtBinaryAdmissionReason reason)
+{
+    if (!jit_ext_stats_enabled() ||
+        reason < 0 || reason >= PYJIT_EXT_BINARY_ADMISSION_REASON_COUNT) {
+        return;
+    }
+
+    static const char *reason_names[PYJIT_EXT_BINARY_ADMISSION_REASON_COUNT] = {
+        "visit",
+        "supported_op_skip",
+        "missing_left_type",
+        "missing_right_type",
+        "unsupported_type_pair",
+        "provider_not_found",
+        "site_disabled",
+        "site_disabled_numpy_shape_mismatch",
+        "site_disabled_numpy_scalar_array_not_c_contiguous",
+        "site_disabled_miss_threshold",
+        "site_disabled_strided_min_elements",
+        "try_plan",
+        "try_plan_null",
+        "plan_success",
+        "emit_external_uop",
+    };
+    const char *left_name = left_type != NULL ? left_type->tp_name : "";
+    const char *right_name = right_type != NULL ? right_type->tp_name : "";
+
+    PyMutex_Lock(&jit_ext_binary_admission_detail_mutex);
+    const char *dir = Py_GETENV("PYTHON_JIT_EXT_STATS_DIR");
+    if (dir == NULL || dir[0] == '\0') {
+        dir = ".";
+    }
+    char path[4096];
+    PyOS_snprintf(path, sizeof(path), "%s/%s",
+                  dir, "crossjit_binary_admission_detail.ndjson");
+    FILE *fp = fopen(path, "a");
+    if (fp != NULL) {
+        fprintf(fp,
+                "{\"oparg\":%ld,"
+                "\"left_type\":\"%s\",\"left_type_ptr\":\"%p\","
+                "\"right_type\":\"%s\",\"right_type_ptr\":\"%p\","
+                "\"reason\":\"%s\",\"count\":1}\n",
+                (long)binary_oparg,
+                left_name, (void *)left_type,
+                right_name, (void *)right_type,
+                reason_names[reason]);
+        fclose(fp);
+    }
+
+    for (PyJitExtBinaryAdmissionEntry *entry = jit_ext_binary_admission_detail;
+         entry != NULL; entry = entry->next) {
+        if (entry->binary_oparg == binary_oparg &&
+            entry->reason == reason &&
+            entry->left_type == left_type &&
+            entry->right_type == right_type) {
+            entry->count++;
+            PyMutex_Unlock(&jit_ext_binary_admission_detail_mutex);
+            jit_ext_stats_register_atexit();
+            return;
+        }
+    }
+    PyJitExtBinaryAdmissionEntry *entry = PyMem_RawCalloc(1, sizeof(*entry));
+    if (entry != NULL) {
+        entry->binary_oparg = binary_oparg;
+        entry->reason = reason;
+        entry->left_type = left_type;
+        entry->right_type = right_type;
+        entry->count = 1;
+        PyOS_snprintf(entry->left_type_name, sizeof(entry->left_type_name), "%s", left_name);
+        PyOS_snprintf(entry->right_type_name, sizeof(entry->right_type_name), "%s", right_name);
+        entry->next = jit_ext_binary_admission_detail;
+        jit_ext_binary_admission_detail = entry;
+    }
+    PyMutex_Unlock(&jit_ext_binary_admission_detail_mutex);
+    jit_ext_stats_register_atexit();
+}
+
+static void
+jit_ext_site_capsule_destructor(PyObject *capsule)
+{
+    PyJitExtSiteState *site = PyCapsule_GetPointer(capsule, PYJIT_EXT_SITE_CAPSULE);
+    if (site != NULL) {
+        PyMem_Free(site);
+    }
+    else {
+        PyErr_Clear();
+    }
+}
+
+static PyObject *
+jit_ext_site_key(PyCodeObject *code, int target,
+                 const PyJitExtTraceRequest *request)
+{
+    PyObject *target_obj = PyLong_FromLong(target);
+    if (target_obj == NULL) {
+        return NULL;
+    }
+    PyObject *kind_obj = PyLong_FromLong((long)request->kind);
+    if (kind_obj == NULL) {
+        Py_DECREF(target_obj);
+        return NULL;
+    }
+    PyObject *arg_obj;
+    if (request->kind == PYJIT_EXT_TRACE_BINARY) {
+        arg_obj = PyLong_FromLong(request->u.binary.binary_oparg);
+    }
+    else if (request->kind == PYJIT_EXT_TRACE_CALL) {
+        arg_obj = request->u.call.callable;
+        Py_INCREF(arg_obj);
+    }
+    else {
+        Py_DECREF(target_obj);
+        Py_DECREF(kind_obj);
+        Py_RETURN_NONE;
+    }
+    if (arg_obj == NULL) {
+        Py_DECREF(target_obj);
+        Py_DECREF(kind_obj);
+        return NULL;
+    }
+    PyObject *key = PyTuple_Pack(4, code, target_obj, kind_obj, arg_obj);
+    Py_DECREF(target_obj);
+    Py_DECREF(kind_obj);
+    Py_DECREF(arg_obj);
+    return key;
+}
+
+PyJitExtSiteState *
+_PyJit_GetExtSiteState(PyCodeObject *code, int target,
+                       const PyJitExtTraceRequest *request, int create)
+{
+    if (code == NULL || request == NULL) {
+        return NULL;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return NULL;
+    }
+    PyObject *registry = jit_ext_site_registry_get(tstate->interp, create);
+    if (registry == NULL) {
+        return NULL;
+    }
+    PyObject *key = jit_ext_site_key(code, target, request);
+    if (key == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject *capsule = PyDict_GetItemWithError(registry, key);
+    if (capsule != NULL) {
+        PyJitExtSiteState *site = PyCapsule_GetPointer(
+            capsule, PYJIT_EXT_SITE_CAPSULE);
+        Py_DECREF(key);
+        if (site == NULL) {
+            PyErr_Clear();
+        }
+        return site;
+    }
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+        Py_DECREF(key);
+        return NULL;
+    }
+    if (!create) {
+        Py_DECREF(key);
+        return NULL;
+    }
+
+    PyJitExtSiteState *site = PyMem_Calloc(1, sizeof(*site));
+    if (site == NULL) {
+        Py_DECREF(key);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    site->trace_kind = (uint8_t)request->kind;
+    site->site_id = jit_ext_next_site_id++;
+    capsule = PyCapsule_New(site, PYJIT_EXT_SITE_CAPSULE,
+                            jit_ext_site_capsule_destructor);
+    if (capsule == NULL) {
+        PyMem_Free(site);
+        Py_DECREF(key);
+        return NULL;
+    }
+    if (PyDict_SetItem(registry, key, capsule) < 0) {
+        Py_DECREF(capsule);
+        Py_DECREF(key);
+        return NULL;
+    }
+    Py_DECREF(capsule);
+    Py_DECREF(key);
+    return site;
+}
+
+void
+_PyJit_DumpExtSiteStats(PyInterpreterState *interp)
+{
+    if (!jit_ext_stats_enabled() ||
+        interp == NULL || interp->jit_ext_site_registry == NULL) {
+        return;
+    }
+
+    const char *dir = Py_GETENV("PYTHON_JIT_EXT_STATS_DIR");
+    if (dir == NULL || dir[0] == '\0') {
+        dir = ".";
+    }
+    char path[4096];
+    PyOS_snprintf(path, sizeof(path), "%s/%s", dir, "crossjit_ext_sites.ndjson");
+    FILE *fp = fopen(path, "w");
+    if (fp == NULL) {
+        return;
+    }
+
+    PyObject *key;
+    PyObject *capsule;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(interp->jit_ext_site_registry, &pos, &key, &capsule)) {
+        PyJitExtSiteState *site = PyCapsule_GetPointer(
+            capsule, PYJIT_EXT_SITE_CAPSULE);
+        if (site == NULL) {
+            PyErr_Clear();
+            continue;
+        }
+        PyObject *code = PyTuple_GET_ITEM(key, 0);
+        PyObject *target = PyTuple_GET_ITEM(key, 1);
+        PyObject *kind = PyTuple_GET_ITEM(key, 2);
+        PyObject *arg = PyTuple_GET_ITEM(key, 3);
+        long target_value = PyLong_AsLong(target);
+        if (target_value == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            target_value = -1;
+        }
+        long kind_value = PyLong_AsLong(kind);
+        if (kind_value == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            kind_value = -1;
+        }
+        long arg_value = PyLong_Check(arg) ? PyLong_AsLong(arg) : -1;
+        if (arg_value == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+        }
+        const char *code_name = "?";
+        const char *filename = "?";
+        int firstlineno = -1;
+        static const char *guard_names[PYJIT_EXT_GUARD_FAIL_REASON_COUNT] = {
+            "not_exact_ndarray",
+            "dtype_mismatch",
+            "not_c_contiguous",
+            "ndim_mismatch",
+            "shape_mismatch",
+            "min_elements",
+            "not_scalar",
+            "scalar_convert_failed",
+            "strided_min_elements",
+        };
+        const char *top_guard_fail_reason = "";
+        uint64_t top_guard_fail_count = 0;
+        for (int i = 0; i < PYJIT_EXT_GUARD_FAIL_REASON_COUNT; i++) {
+            if (site->guard_fail_counts[i] > top_guard_fail_count) {
+                top_guard_fail_count = site->guard_fail_counts[i];
+                top_guard_fail_reason = guard_names[i];
+            }
+        }
+        if (PyCode_Check(code)) {
+            PyCodeObject *co = (PyCodeObject *)code;
+            if (PyUnicode_Check(co->co_name)) {
+                const char *name = PyUnicode_AsUTF8(co->co_name);
+                if (name != NULL) {
+                    code_name = name;
+                }
+                else {
+                    PyErr_Clear();
+                }
+            }
+            if (PyUnicode_Check(co->co_filename)) {
+                const char *name = PyUnicode_AsUTF8(co->co_filename);
+                if (name != NULL) {
+                    filename = name;
+                }
+                else {
+                    PyErr_Clear();
+                }
+            }
+            firstlineno = co->co_firstlineno;
+        }
+        fprintf(fp,
+                "{\"site_id\":%" PRIu32 ",\"kind\":%ld,\"target\":%ld,"
+                "\"arg\":%ld,\"callable\":\"%p\",\"code\":\"%s\","
+                "\"filename\":\"%s\",\"firstlineno\":%d,"
+                "\"hit_count\":%u,\"miss_count\":%u,"
+                "\"decline_count\":%u,"
+                "\"fused_site_count\":%u,"
+                "\"fused_hit_count\":%u,"
+                "\"fused_miss_count\":%u,"
+                "\"fused_pattern\":\"%s\","
+                "\"optimizer_skip_after_disable\":%" PRIu64 ","
+                "\"element_count_min\":%" PRId64 ","
+                "\"element_count_max\":%" PRId64 ","
+                "\"element_count_last\":%" PRId64 ","
+                "\"disabled\":%u,\"disable_reason\":\"%s\","
+                "\"top_guard_fail_reason\":\"%s\","
+                "\"top_guard_fail_count\":%" PRIu64 "}\n",
+                site->site_id, kind_value, target_value, arg_value,
+                PyLong_Check(arg) ? NULL : (void *)arg,
+                code_name, filename, firstlineno,
+                (unsigned)site->hit_count, (unsigned)site->miss_count,
+                (unsigned)site->decline_count,
+                (unsigned)site->fused_site_count,
+                (unsigned)site->fused_hit_count,
+                (unsigned)site->fused_miss_count,
+                site->fused_pattern != NULL ? site->fused_pattern : "",
+                site->optimizer_skip_after_disable,
+                site->element_count_min,
+                site->element_count_max,
+                site->element_count_last,
+                (unsigned)site->disabled,
+                site->disable_reason != NULL ? site->disable_reason : "",
+                top_guard_fail_reason, top_guard_fail_count);
+    }
+    fclose(fp);
+}
+
+void
+_PyJit_DumpExtOptimizerStats(PyInterpreterState *interp)
+{
+    if (!jit_ext_stats_enabled() || interp == NULL) {
+        return;
+    }
+
+    const char *dir = Py_GETENV("PYTHON_JIT_EXT_STATS_DIR");
+    if (dir == NULL || dir[0] == '\0') {
+        dir = ".";
+    }
+    char path[4096];
+    PyOS_snprintf(path, sizeof(path), "%s/%s",
+                  dir, "crossjit_optimizer_summary.ndjson");
+    FILE *fp = fopen(path, "w");
+    if (fp == NULL) {
+        return;
+    }
+
+    static const char *kind_names[] = {"binary", "call", "fused_binary2"};
+    for (int kind = PYJIT_EXT_TRACE_BINARY; kind <= PYJIT_EXT_TRACE_FUSED_BINARY2; kind++) {
+        uint64_t *counts = interp->jit_ext_optimizer_counts[kind];
+        fprintf(fp,
+                "{\"kind\":\"%s\","
+                "\"visit\":%" PRIu64 ","
+                "\"supported_op_skip\":%" PRIu64 ","
+                "\"provider_prefilter_miss\":%" PRIu64 ","
+                "\"provider_lookup\":%" PRIu64 ","
+                "\"try_plan\":%" PRIu64 ","
+                "\"plan_success\":%" PRIu64 ","
+                "\"emit_external_uop\":%" PRIu64 ","
+                "\"executor_created\":%" PRIu64 ","
+                "\"executor_invalidated\":%" PRIu64 "}\n",
+                kind_names[kind],
+                counts[PYJIT_EXT_OPT_VISIT],
+                counts[PYJIT_EXT_OPT_SUPPORTED_OP_SKIP],
+                counts[PYJIT_EXT_OPT_PROVIDER_PREFILTER_MISS],
+                counts[PYJIT_EXT_OPT_PROVIDER_LOOKUP],
+                counts[PYJIT_EXT_OPT_TRY_PLAN],
+                counts[PYJIT_EXT_OPT_PLAN_SUCCESS],
+                counts[PYJIT_EXT_OPT_EMIT_UOP],
+                counts[PYJIT_EXT_OPT_EXECUTOR_CREATED],
+                counts[PYJIT_EXT_OPT_EXECUTOR_INVALIDATED]);
+    }
+    fclose(fp);
+}
+
+void
+_PyJit_DumpExtBinaryAdmissionStats(PyInterpreterState *interp)
+{
+    if (!jit_ext_stats_enabled() ||
+        interp == NULL || jit_ext_binary_admission_detail == NULL) {
+        return;
+    }
+
+    const char *dir = Py_GETENV("PYTHON_JIT_EXT_STATS_DIR");
+    if (dir == NULL || dir[0] == '\0') {
+        dir = ".";
+    }
+    char path[4096];
+    PyOS_snprintf(path, sizeof(path), "%s/%s",
+                  dir, "crossjit_binary_admission_detail.ndjson");
+    FILE *fp = fopen(path, "w");
+    if (fp == NULL) {
+        return;
+    }
+
+    static const char *reason_names[PYJIT_EXT_BINARY_ADMISSION_REASON_COUNT] = {
+        "visit",
+        "supported_op_skip",
+        "missing_left_type",
+        "missing_right_type",
+        "unsupported_type_pair",
+        "provider_not_found",
+        "site_disabled",
+        "site_disabled_numpy_shape_mismatch",
+        "site_disabled_numpy_scalar_array_not_c_contiguous",
+        "site_disabled_miss_threshold",
+        "site_disabled_strided_min_elements",
+        "try_plan",
+        "try_plan_null",
+        "plan_success",
+        "emit_external_uop",
+    };
+
+    for (PyJitExtBinaryAdmissionEntry *entry = jit_ext_binary_admission_detail;
+         entry != NULL; entry = entry->next) {
+        int reason = entry->reason;
+        if (reason < 0 || reason >= PYJIT_EXT_BINARY_ADMISSION_REASON_COUNT) {
+            continue;
+        }
+        fprintf(fp,
+                "{\"oparg\":%ld,"
+                "\"left_type\":\"%s\",\"left_type_ptr\":\"%p\","
+                "\"right_type\":\"%s\",\"right_type_ptr\":\"%p\","
+                "\"reason\":\"%s\",\"count\":%" PRIu64 "}\n",
+                (long)entry->binary_oparg,
+                entry->left_type_name, (void *)entry->left_type,
+                entry->right_type_name, (void *)entry->right_type,
+                reason_names[reason], entry->count);
+    }
+    fclose(fp);
 }
 
 static PyObject *
@@ -110,7 +752,7 @@ jit_provider_check(PyJitExtProvider *provider)
         return -1;
     }
     if (provider->abi_version != PYJIT_EXT_ABI_VERSION ||
-        provider->struct_size < sizeof(PyJitExtProvider)) {
+        provider->struct_size < offsetof(PyJitExtProvider, describe_plan)) {
         PyErr_SetString(PyExc_ValueError,
                         "unsupported JIT extension provider ABI");
         return -1;
@@ -167,6 +809,25 @@ PyJit_RegisterBinaryProvider(PyTypeObject *left_type,
         return -1;
     }
     int result = PyDict_SetItem(registry, key, capsule);
+    if (result == 0) {
+        uint64_t bit = jit_binary_provider_oparg_bit(binary_oparg);
+        if (bit != 0) {
+            tstate->interp->jit_binary_provider_oparg_mask |= bit;
+        }
+        if (jit_binary_provider_cache_find(
+                tstate->interp, left_type, right_type, binary_oparg) < 0) {
+            uint8_t count = tstate->interp->jit_binary_provider_cache_count;
+            if (count < PYJIT_EXT_BINARY_PROVIDER_CACHE_MAX) {
+                tstate->interp->jit_binary_provider_left_types[count] = left_type;
+                tstate->interp->jit_binary_provider_right_types[count] = right_type;
+                tstate->interp->jit_binary_provider_opargs[count] = binary_oparg;
+                tstate->interp->jit_binary_provider_cache_count = count + 1;
+            }
+            else {
+                tstate->interp->jit_binary_provider_cache_overflow = 1;
+            }
+        }
+    }
     Py_DECREF(key);
     Py_DECREF(capsule);
     return result;
@@ -196,6 +857,20 @@ PyJit_UnregisterBinaryProvider(PyTypeObject *left_type,
         PyErr_Clear();
         return 0;
     }
+    if (result == 0) {
+        int index = jit_binary_provider_cache_find(
+            tstate->interp, left_type, right_type, binary_oparg);
+        if (index >= 0) {
+            uint8_t last = tstate->interp->jit_binary_provider_cache_count - 1;
+            tstate->interp->jit_binary_provider_left_types[index] =
+                tstate->interp->jit_binary_provider_left_types[last];
+            tstate->interp->jit_binary_provider_right_types[index] =
+                tstate->interp->jit_binary_provider_right_types[last];
+            tstate->interp->jit_binary_provider_opargs[index] =
+                tstate->interp->jit_binary_provider_opargs[last];
+            tstate->interp->jit_binary_provider_cache_count = last;
+        }
+    }
     return result;
 }
 
@@ -213,6 +888,10 @@ PyJit_LookupBinaryProvider(PyTypeObject *left_type,
     }
     PyObject *registry = jit_binary_provider_registry_get(tstate->interp, 0);
     if (registry == NULL) {
+        return NULL;
+    }
+    if (!_PyJit_MaybeHasBinaryProviderForTypesOparg(
+            left_type, right_type, binary_oparg)) {
         return NULL;
     }
     PyObject *key = jit_binary_provider_key(left_type, right_type, binary_oparg);
@@ -253,6 +932,17 @@ PyJit_RegisterCallableProvider(PyObject *callable, PyJitExtProvider *provider)
         return -1;
     }
     int result = PyDict_SetItem(registry, callable, capsule);
+    if (result == 0 &&
+        jit_callable_provider_cache_find(tstate->interp, callable) < 0) {
+        uint8_t count = tstate->interp->jit_callable_provider_cache_count;
+        if (count < PYJIT_EXT_CALLABLE_PROVIDER_CACHE_MAX) {
+            tstate->interp->jit_callable_provider_callables[count] = callable;
+            tstate->interp->jit_callable_provider_cache_count = count + 1;
+        }
+        else {
+            tstate->interp->jit_callable_provider_cache_overflow = 1;
+        }
+    }
     Py_DECREF(capsule);
     return result;
 }
@@ -274,6 +964,16 @@ PyJit_UnregisterCallableProvider(PyObject *callable)
         PyErr_Clear();
         return 0;
     }
+    if (result == 0) {
+        int index = jit_callable_provider_cache_find(tstate->interp, callable);
+        if (index >= 0) {
+            uint8_t last = tstate->interp->jit_callable_provider_cache_count - 1;
+            tstate->interp->jit_callable_provider_callables[index] =
+                tstate->interp->jit_callable_provider_callables[last];
+            tstate->interp->jit_callable_provider_callables[last] = NULL;
+            tstate->interp->jit_callable_provider_cache_count = last;
+        }
+    }
     return result;
 }
 
@@ -289,6 +989,10 @@ PyJit_LookupCallableProvider(PyObject *callable)
     }
     PyObject *registry = jit_callable_provider_registry_get(tstate->interp, 0);
     if (registry == NULL) {
+        return NULL;
+    }
+    if (!tstate->interp->jit_callable_provider_cache_overflow &&
+        jit_callable_provider_cache_find(tstate->interp, callable) < 0) {
         return NULL;
     }
     PyObject *capsule = PyDict_GetItemWithError(registry, callable);
@@ -1810,7 +2514,12 @@ static PyJitExtPlan *
 ext_plan_from_uop(const _PyUOpInstruction *instruction)
 {
     uint16_t opcode = _PyUop_Uncached[instruction->opcode];
+    if (opcode == 0) {
+        opcode = instruction->opcode;
+    }
     if (opcode == _EXT_BINARY_EXEC ||
+        opcode == _EXT_FUSED_BINARY2_EXEC ||
+        opcode == _EXT_FUSED_BINARY2_RIGHT_EXEC ||
         opcode == _EXT_CALL_EXEC) {
         return (PyJitExtPlan *)(uintptr_t)instruction->operand0;
     }
@@ -1852,6 +2561,933 @@ free_ext_plans_from_uops(_PyUOpInstruction *buffer, int length)
     }
 }
 
+static bool
+jit_ext_is_base_uop(const _PyUOpInstruction *inst, uint16_t base_opcode)
+{
+    uint16_t opcode = _PyUop_Uncached[inst->opcode];
+    if (opcode == 0) {
+        opcode = inst->opcode;
+    }
+    return opcode == base_opcode;
+}
+
+static bool
+jit_ext_is_load_fast_borrow_uop(const _PyUOpInstruction *inst)
+{
+    uint16_t opcode = _PyUop_Uncached[inst->opcode];
+    if (opcode == 0) {
+        opcode = inst->opcode;
+    }
+    return opcode == _LOAD_FAST_BORROW ||
+           (opcode >= _LOAD_FAST_BORROW_0 && opcode <= _LOAD_FAST_BORROW_7);
+}
+
+static void
+jit_ext_force_load_fast_borrow_r23(_PyUOpInstruction *inst)
+{
+    uint16_t opcode = _PyUop_Uncached[inst->opcode];
+    if (opcode == 0) {
+        opcode = inst->opcode;
+    }
+    if (opcode == _LOAD_FAST_BORROW) {
+        inst->opcode = _LOAD_FAST_BORROW_r23;
+    }
+    else {
+        assert(opcode >= _LOAD_FAST_BORROW_0 &&
+               opcode <= _LOAD_FAST_BORROW_7);
+        inst->opcode = _LOAD_FAST_BORROW_0_r23 +
+            (opcode - _LOAD_FAST_BORROW_0) * 3;
+    }
+}
+
+static void
+jit_ext_make_nop(_PyUOpInstruction *inst)
+{
+    memset(inst, 0, sizeof(*inst));
+    inst->opcode = _NOP_r00;
+}
+
+static void
+jit_ext_make_base_nop(_PyUOpInstruction *inst)
+{
+    memset(inst, 0, sizeof(*inst));
+    inst->opcode = _NOP;
+}
+
+static int
+jit_ext_fused_debug_enabled(void)
+{
+    char *enabled = Py_GETENV("PYTHON_JIT_EXT_DEBUG_FUSED_BINARY2");
+    return enabled != NULL && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+static int
+jit_ext_fused_dump_enabled(void)
+{
+    char *enabled = Py_GETENV("PYTHON_JIT_EXT_FUSED_DUMP_TRACE");
+    return enabled != NULL && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+static int
+jit_ext_fusion_candidates_enabled(void)
+{
+    char *enabled = Py_GETENV("PYTHON_JIT_EXT_FUSION_CANDIDATES");
+    return enabled != NULL && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+static void
+jit_ext_fused_trace_path(char *path, size_t path_size)
+{
+    const char *dir = Py_GETENV("PYTHON_JIT_EXT_STATS_DIR");
+    if (dir == NULL || dir[0] == '\0') {
+        dir = "/tmp";
+    }
+    PyOS_snprintf(path, path_size, "%s/%s",
+                  dir, "crossjit_fused_binary2_trace.ndjson");
+}
+
+static void
+jit_ext_fusion_candidate_path(char *path, size_t path_size)
+{
+    const char *dir = Py_GETENV("PYTHON_JIT_EXT_STATS_DIR");
+    if (dir == NULL || dir[0] == '\0') {
+        dir = "/tmp";
+    }
+    PyOS_snprintf(path, path_size, "%s/%s",
+                  dir, "crossjit_fusion_candidates.ndjson");
+}
+
+static void
+jit_ext_json_write_string(FILE *fp, const char *value)
+{
+    fputc('"', fp);
+    if (value != NULL) {
+        for (const unsigned char *p = (const unsigned char *)value; *p != 0; p++) {
+            if (*p == '"' || *p == '\\') {
+                fputc('\\', fp);
+                fputc(*p, fp);
+            }
+            else if (*p == '\n') {
+                fputs("\\n", fp);
+            }
+            else if (*p == '\r') {
+                fputs("\\r", fp);
+            }
+            else if (*p == '\t') {
+                fputs("\\t", fp);
+            }
+            else if (*p < 0x20) {
+                fprintf(fp, "\\u%04x", (unsigned)*p);
+            }
+            else {
+                fputc(*p, fp);
+            }
+        }
+    }
+    fputc('"', fp);
+}
+
+static int
+jit_ext_parse_cache_suffix(uint16_t opcode, int *cache_inputs,
+                           int *cache_outputs)
+{
+    const char *name = opcode <= MAX_UOP_REGS_ID ?
+        _PyOpcode_uop_name[opcode] : NULL;
+    if (name == NULL) {
+        return 0;
+    }
+    size_t len = strlen(name);
+    if (len < 4 || name[len - 4] != '_' || name[len - 3] != 'r' ||
+        name[len - 1] < '0' || name[len - 1] > '9') {
+        return 0;
+    }
+    char input = name[len - 2];
+    char output = name[len - 1];
+    if (output < '0' || output > '9') {
+        return 0;
+    }
+    *cache_inputs = input - '0';
+    *cache_outputs = output - '0';
+    return 1;
+}
+
+static void
+jit_ext_dump_fused_binary2_trace(const char *phase,
+                                 _PyUOpInstruction *buffer, int length,
+                                 int rewrite_index)
+{
+    if (!jit_ext_fused_dump_enabled()) {
+        return;
+    }
+    char path[4096];
+    jit_ext_fused_trace_path(path, sizeof(path));
+    FILE *fp = fopen(path, "a");
+    if (fp == NULL) {
+        return;
+    }
+    for (int i = 0; i < length; i++) {
+        _PyUOpInstruction *inst = &buffer[i];
+        uint16_t base = inst->opcode <= MAX_UOP_REGS_ID ?
+            _PyUop_Uncached[inst->opcode] : 0;
+        if (base == 0) {
+            base = inst->opcode;
+        }
+        const char *name = inst->opcode <= MAX_UOP_REGS_ID ?
+            _PyOpcode_uop_name[inst->opcode] : NULL;
+        const char *base_name = base <= MAX_UOP_REGS_ID ?
+            _PyOpcode_uop_name[base] : NULL;
+        int cache_inputs = -1;
+        int cache_outputs = -1;
+        int has_cache_suffix = jit_ext_parse_cache_suffix(
+            inst->opcode, &cache_inputs, &cache_outputs);
+        PyJitExtPlan *plan = ext_plan_from_uop(inst);
+        fprintf(fp,
+                "{\"phase\":\"%s\",\"rewrite_index\":%d,"
+                "\"index\":%d,\"opcode\":%u,"
+                "\"opcode_name\":\"%s\",\"oparg\":%d,"
+                "\"target\":%u,\"jump_target\":%u,\"error_target\":%u,"
+                "\"operand0\":%" PRIu64 ",\"operand1\":%" PRIu64 ","
+                "\"plan_ptr\":\"%p\",\"plan_kind\":%d,"
+                "\"is_allocated_variant\":%s,"
+                "\"base_opcode\":%u,\"base_opcode_name\":\"%s\","
+                "\"cache_inputs\":%d,\"cache_outputs\":%d}\n",
+                phase, rewrite_index, i, (unsigned)inst->opcode,
+                name != NULL ? name : "",
+                (int)inst->oparg,
+                (unsigned)inst->target,
+                (unsigned)inst->jump_target,
+                (unsigned)inst->error_target,
+                (uint64_t)inst->operand0,
+                (uint64_t)inst->operand1,
+                (void *)plan,
+                plan != NULL ? (int)plan->kind : -1,
+                (base != inst->opcode) ? "true" : "false",
+                (unsigned)base,
+                base_name != NULL ? base_name : "",
+                has_cache_suffix ? cache_inputs : -1,
+                has_cache_suffix ? cache_outputs : -1);
+    }
+    fclose(fp);
+}
+
+static int
+jit_ext_find_next_binary_exec(_PyUOpInstruction *buffer, int length,
+                              int start)
+{
+    for (int i = start + 1; i < length; i++) {
+        if (jit_ext_is_base_uop(&buffer[i], _EXT_BINARY_EXEC)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void
+jit_ext_dump_opcode_window(FILE *fp, _PyUOpInstruction *buffer, int length,
+                           int first, int last)
+{
+    fputc('[', fp);
+    int written = 0;
+    if (first < 0) {
+        first = 0;
+    }
+    if (last >= length) {
+        last = length - 1;
+    }
+    for (int i = first; i <= last; i++) {
+        uint16_t base = buffer[i].opcode <= MAX_UOP_REGS_ID ?
+            _PyUop_Uncached[buffer[i].opcode] : 0;
+        if (base == 0) {
+            base = buffer[i].opcode;
+        }
+        const char *name = buffer[i].opcode <= MAX_UOP_REGS_ID ?
+            _PyOpcode_uop_name[buffer[i].opcode] : NULL;
+        const char *base_name = base <= MAX_UOP_REGS_ID ?
+            _PyOpcode_uop_name[base] : NULL;
+        if (written) {
+            fputc(',', fp);
+        }
+        fprintf(fp, "{\"index\":%d,\"opcode\":%u,\"opcode_name\":",
+                i, (unsigned)buffer[i].opcode);
+        jit_ext_json_write_string(fp, name != NULL ? name : "");
+        fprintf(fp, ",\"base_opcode\":%u,\"base_opcode_name\":",
+                (unsigned)base);
+        jit_ext_json_write_string(fp, base_name != NULL ? base_name : "");
+        fputc('}', fp);
+        written = 1;
+    }
+    fputc(']', fp);
+}
+
+typedef struct {
+    int valid;
+    int first_result_id;
+    int second_other_id;
+    int second_left_id;
+    int second_right_id;
+    const char *second_consumes;
+    int stack_depth_at_first;
+    int stack_depth_at_second;
+    int second_other_depth_from_top_at_first;
+} JitExtBinaryPairStackInfo;
+
+static int
+jit_ext_uop_cache_net(uint16_t opcode)
+{
+    if (opcode > MAX_UOP_ID) {
+        return INT_MIN;
+    }
+    const _PyUopCachingInfo *cache = &_PyUop_Caching[opcode];
+    for (int input = 0; input <= MAX_CACHED_REGISTER; input++) {
+        if (cache->entries[input].opcode != 0 &&
+            cache->entries[input].output >= 0) {
+            return (int)cache->entries[input].output - input;
+        }
+    }
+    return INT_MIN;
+}
+
+static int
+jit_ext_uop_num_pushed_for_stack_telemetry(uint16_t opcode, int oparg)
+{
+    if (opcode == _NOP ||
+        opcode == _CHECK_VALIDITY ||
+        opcode == _SET_IP ||
+        opcode == _SPILL_OR_RELOAD) {
+        return 0;
+    }
+    if (opcode == _POP_TOP ||
+        opcode == _POP_TOP_NOP ||
+        opcode == _POP_TOP_INT ||
+        opcode == _POP_TOP_FLOAT ||
+        opcode == _POP_TOP_UNICODE ||
+        opcode == _POP_TOP_OPARG) {
+        return 0;
+    }
+    if (opcode == _EXT_BINARY_EXEC) {
+        return 3;
+    }
+    if (opcode == _EXT_FUSED_BINARY2_EXEC ||
+        opcode == _EXT_FUSED_BINARY2_RIGHT_EXEC) {
+        return 4;
+    }
+    int popped = _PyUop_num_popped(opcode, oparg);
+    int net = jit_ext_uop_cache_net(opcode);
+    if (net == INT_MIN) {
+        return INT_MIN;
+    }
+    return popped + net;
+}
+
+static JitExtBinaryPairStackInfo
+jit_ext_analyze_binary_pair_stack(_PyUOpInstruction *buffer, int length,
+                                  int first_index, int second_index)
+{
+    JitExtBinaryPairStackInfo info = {
+        .valid = 0,
+        .first_result_id = -1,
+        .second_other_id = -1,
+        .second_left_id = -1,
+        .second_right_id = -1,
+        .second_consumes = "unknown",
+        .stack_depth_at_first = -1,
+        .stack_depth_at_second = -1,
+        .second_other_depth_from_top_at_first = -1,
+    };
+    if (first_index < 0 || second_index < 0 ||
+        first_index >= length || second_index >= length ||
+        first_index >= second_index) {
+        return info;
+    }
+
+    int stack[UOP_MAX_TRACE_LENGTH * 4];
+    int stack_at_first[UOP_MAX_TRACE_LENGTH * 4];
+    int depth = 0;
+    int depth_at_first = 0;
+    int next_value_id = 1;
+    for (int i = 0; i <= second_index; i++) {
+        uint16_t opcode = _PyUop_Uncached[buffer[i].opcode];
+        if (opcode == 0) {
+            opcode = buffer[i].opcode;
+        }
+        int popped = _PyUop_num_popped(opcode, buffer[i].oparg);
+        int pushed = jit_ext_uop_num_pushed_for_stack_telemetry(
+            opcode, buffer[i].oparg);
+        if (pushed == INT_MIN || popped < 0 ||
+            depth < popped ||
+            depth - popped + pushed >= (int)Py_ARRAY_LENGTH(stack)) {
+            return info;
+        }
+        if (i == first_index) {
+            if (opcode != _EXT_BINARY_EXEC || popped < 2 || pushed < 1) {
+                return info;
+            }
+            info.stack_depth_at_first = depth;
+            depth_at_first = depth;
+            memcpy(stack_at_first, stack, sizeof(int) * (size_t)depth);
+        }
+        if (i == second_index) {
+            if (opcode != _EXT_BINARY_EXEC || popped < 2) {
+                return info;
+            }
+            info.stack_depth_at_second = depth;
+            info.second_left_id = stack[depth - 2];
+            info.second_right_id = stack[depth - 1];
+        }
+
+        depth -= popped;
+        for (int out = 0; out < pushed; out++) {
+            int value_id = next_value_id++;
+            if (i == first_index && out == 0) {
+                info.first_result_id = value_id;
+            }
+            stack[depth++] = value_id;
+        }
+    }
+    info.valid = 1;
+    if (info.first_result_id == info.second_left_id) {
+        info.second_consumes = "left";
+        info.second_other_id = info.second_right_id;
+    }
+    else if (info.first_result_id == info.second_right_id) {
+        info.second_consumes = "right";
+        info.second_other_id = info.second_left_id;
+    }
+    else {
+        info.second_consumes = "none";
+    }
+    if (info.second_other_id >= 0) {
+        for (int i = depth_at_first - 1; i >= 0; i--) {
+            if (stack_at_first[i] == info.second_other_id) {
+                info.second_other_depth_from_top_at_first =
+                    depth_at_first - 1 - i;
+                break;
+            }
+        }
+    }
+    return info;
+}
+
+static void
+jit_ext_dump_plan_summary(FILE *fp, const char *prefix, PyJitExtPlan *plan)
+{
+    fprintf(fp, "\"%s_plan_ptr\":\"%p\",", prefix, (void *)plan);
+    fprintf(fp, "\"%s_plan_kind\":%d,", prefix,
+            plan != NULL ? (int)plan->kind : -1);
+    fprintf(fp, "\"%s_plan_op_id\":%" PRIu32 ",", prefix,
+            plan != NULL ? plan->op_id : 0);
+    fprintf(fp, "\"%s_plan_debug_name\":", prefix);
+    jit_ext_json_write_string(fp,
+                              plan != NULL && plan->debug_name != NULL ?
+                              plan->debug_name : "");
+    fprintf(fp, ",\"%s_provider\":", prefix);
+    jit_ext_json_write_string(fp,
+                              plan != NULL && plan->provider != NULL &&
+                              plan->provider->provider_name != NULL ?
+                              plan->provider->provider_name : "");
+    fprintf(fp, ",\"%s_site_id\":%ld", prefix,
+            plan != NULL && plan->site != NULL ?
+            (long)plan->site->site_id : -1L);
+    fprintf(fp, ",\"%s_plan_info\":", prefix);
+    if (plan == NULL || plan->provider == NULL ||
+        plan->provider->struct_size <
+            offsetof(PyJitExtProvider, describe_plan) +
+            sizeof(plan->provider->describe_plan) ||
+        plan->provider->describe_plan == NULL) {
+        fputs("null", fp);
+        return;
+    }
+    PyJitExtPlanInfo info;
+    memset(&info, 0, sizeof(info));
+    if (!plan->provider->describe_plan(plan, &info)) {
+        fputs("null", fp);
+        return;
+    }
+    fputc('{', fp);
+    fputs("\"op_name\":", fp);
+    jit_ext_json_write_string(fp, info.op_name != NULL ? info.op_name : "");
+    fputs(",\"layout_name\":", fp);
+    jit_ext_json_write_string(fp, info.layout_name != NULL ? info.layout_name : "");
+    fputs(",\"left_role\":", fp);
+    jit_ext_json_write_string(fp, info.left_role != NULL ? info.left_role : "");
+    fputs(",\"right_role\":", fp);
+    jit_ext_json_write_string(fp, info.right_role != NULL ? info.right_role : "");
+    fputs(",\"result_role\":", fp);
+    jit_ext_json_write_string(fp, info.result_role != NULL ? info.result_role : "");
+    fputs(",\"left_dtype\":", fp);
+    jit_ext_json_write_string(fp, info.left_dtype != NULL ? info.left_dtype : "");
+    fputs(",\"right_dtype\":", fp);
+    jit_ext_json_write_string(fp, info.right_dtype != NULL ? info.right_dtype : "");
+    fputs(",\"result_dtype\":", fp);
+    jit_ext_json_write_string(fp, info.result_dtype != NULL ? info.result_dtype : "");
+    fprintf(fp, ",\"itemsize\":%d,\"min_elements\":%" PRId64,
+            info.itemsize, info.min_elements);
+    fputs(",\"fused_op_name\":", fp);
+    jit_ext_json_write_string(fp,
+                              info.fused_op_name != NULL ? info.fused_op_name : "");
+    fputs(",\"fused_pattern\":", fp);
+    jit_ext_json_write_string(fp,
+                              info.fused_pattern != NULL ? info.fused_pattern : "");
+    fputc('}', fp);
+}
+
+static void
+jit_ext_dump_fusion_candidate(_PyUOpInstruction *buffer, int length,
+                              int first_index, int second_index,
+                              const char *reason)
+{
+    if (!jit_ext_fusion_candidates_enabled()) {
+        return;
+    }
+    PyJitExtPlan *first_plan = ext_plan_from_uop(&buffer[first_index]);
+    PyJitExtPlan *second_plan = NULL;
+    if (second_index >= 0 && second_index < length) {
+        second_plan = ext_plan_from_uop(&buffer[second_index]);
+    }
+    char path[4096];
+    jit_ext_fusion_candidate_path(path, sizeof(path));
+    PyMutex_Lock(&jit_ext_fusion_candidate_mutex);
+    FILE *fp = fopen(path, "a");
+    if (fp != NULL) {
+        fprintf(fp,
+                "{\"first_index\":%d,\"second_index\":%d,"
+                "\"distance\":%d,\"reason\":",
+                first_index, second_index,
+                second_index >= 0 ? second_index - first_index : -1);
+        jit_ext_json_write_string(fp, reason);
+        fputc(',', fp);
+        jit_ext_dump_plan_summary(fp, "first", first_plan);
+        fputc(',', fp);
+        jit_ext_dump_plan_summary(fp, "second", second_plan);
+        JitExtBinaryPairStackInfo stack_info =
+            jit_ext_analyze_binary_pair_stack(buffer, length,
+                                              first_index, second_index);
+        fprintf(fp,
+                ",\"stack_analysis_valid\":%s,"
+                "\"first_result_id\":%d,"
+                "\"second_other_id\":%d,"
+                "\"second_left_id\":%d,"
+                "\"second_right_id\":%d,"
+                "\"second_consumes_first_result\":",
+                stack_info.valid ? "true" : "false",
+                stack_info.first_result_id,
+                stack_info.second_other_id,
+                stack_info.second_left_id,
+                stack_info.second_right_id);
+        jit_ext_json_write_string(fp, stack_info.second_consumes);
+        fprintf(fp,
+                ",\"stack_depth_at_first\":%d,"
+                "\"stack_depth_at_second\":%d,"
+                "\"second_other_depth_from_top_at_first\":%d",
+                stack_info.stack_depth_at_first,
+                stack_info.stack_depth_at_second,
+                stack_info.second_other_depth_from_top_at_first);
+        fputs(",\"opcode_window\":", fp);
+        int window_last = first_index + 12;
+        if (second_index >= 0 && second_index + 8 > window_last) {
+            window_last = second_index + 8;
+        }
+        jit_ext_dump_opcode_window(fp, buffer, length,
+                                   first_index - 2, window_last);
+        fputs("}\n", fp);
+        fclose(fp);
+    }
+    PyMutex_Unlock(&jit_ext_fusion_candidate_mutex);
+}
+
+static void
+jit_ext_scan_pre_ra_fusion_candidates(_PyUOpInstruction *buffer, int length)
+{
+    if (!jit_ext_fusion_candidates_enabled()) {
+        return;
+    }
+    for (int i = 0; i < length; i++) {
+        if (!jit_ext_is_base_uop(&buffer[i], _EXT_BINARY_EXEC)) {
+            continue;
+        }
+        int next_binary = jit_ext_find_next_binary_exec(buffer, length, i);
+        if (next_binary >= 0) {
+            jit_ext_dump_fusion_candidate(buffer, length, i, next_binary,
+                                          "pre_ra_binary_pair");
+        }
+        else {
+            jit_ext_dump_fusion_candidate(buffer, length, i, -1,
+                                          "pre_ra_single_binary");
+        }
+    }
+}
+
+static int
+jit_ext_is_pop_cleanup_uop(_PyUOpInstruction *inst)
+{
+    return jit_ext_is_base_uop(inst, _POP_TOP) ||
+           jit_ext_is_base_uop(inst, _POP_TOP_NOP);
+}
+
+static int
+jit_ext_try_fuse_binary2_pre_ra(_PyUOpInstruction *buffer, int length)
+{
+    int fusion_enabled = Py_GETENV("PYTHON_JIT_EXT_ENABLE_FUSED_BINARY2") != NULL;
+    if (!fusion_enabled) {
+        return 0;
+    }
+
+    for (int first = 0; first < length; first++) {
+        if (!jit_ext_is_base_uop(&buffer[first], _EXT_BINARY_EXEC)) {
+            continue;
+        }
+        int second = jit_ext_find_next_binary_exec(buffer, length, first);
+        if (second < 0 || second + 2 >= length) {
+            continue;
+        }
+        JitExtBinaryPairStackInfo stack_info =
+            jit_ext_analyze_binary_pair_stack(buffer, length, first, second);
+        if (!stack_info.valid ||
+            strcmp(stack_info.second_consumes, "right") != 0 ||
+            stack_info.second_other_depth_from_top_at_first != 2) {
+            continue;
+        }
+        if (first + 2 >= length ||
+            !jit_ext_is_pop_cleanup_uop(&buffer[first + 1]) ||
+            !jit_ext_is_pop_cleanup_uop(&buffer[first + 2]) ||
+            !jit_ext_is_pop_cleanup_uop(&buffer[second + 1]) ||
+            !jit_ext_is_pop_cleanup_uop(&buffer[second + 2])) {
+            jit_ext_dump_fusion_candidate(buffer, length, first, second,
+                                          "pre_ra_right_cleanup_shape_mismatch");
+            continue;
+        }
+
+        int moved_second_other_cleanup = -1;
+        for (int i = first + 3; i < second; i++) {
+            if (jit_ext_is_base_uop(&buffer[i], _NOP)) {
+                moved_second_other_cleanup = i;
+                break;
+            }
+        }
+        if (moved_second_other_cleanup < 0) {
+            jit_ext_dump_fusion_candidate(buffer, length, first, second,
+                                          "pre_ra_right_no_cleanup_slot");
+            continue;
+        }
+
+        PyJitExtPlan *first_plan = ext_plan_from_uop(&buffer[first]);
+        PyJitExtPlan *second_plan = ext_plan_from_uop(&buffer[second]);
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_VISIT);
+        if (first_plan == NULL || second_plan == NULL ||
+            first_plan->provider == NULL ||
+            first_plan->provider != second_plan->provider ||
+            first_plan->provider->try_plan == NULL) {
+            jit_ext_dump_fusion_candidate(buffer, length, first, second,
+                                          "pre_ra_right_provider_mismatch_or_missing_plan");
+            continue;
+        }
+
+        PyJitExtTraceRequest request = {
+            .kind = PYJIT_EXT_TRACE_FUSED_BINARY2,
+            .u.fused_binary2 = {
+                .first_plan = first_plan,
+                .second_plan = second_plan,
+                .flags = PYJIT_EXT_FUSED_BINARY2_SECOND_CONSUMES_RIGHT,
+            },
+        };
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_TRY_PLAN);
+        PyJitExtPlan *fused = first_plan->provider->try_plan(
+            &request, first_plan->site);
+        if (fused == NULL) {
+            if (PyErr_Occurred()) {
+                PyErr_Clear();
+            }
+            jit_ext_dump_fusion_candidate(buffer, length, first, second,
+                                          "pre_ra_right_provider_reject");
+            continue;
+        }
+        fused->site = first_plan->site;
+
+        _PyUOpInstruction second_other_cleanup = buffer[second + 2];
+        buffer[first].opcode = _EXT_FUSED_BINARY2_RIGHT_EXEC;
+        buffer[first].oparg = 0;
+        buffer[first].operand0 = (uintptr_t)fused;
+        buffer[moved_second_other_cleanup] = second_other_cleanup;
+
+        jit_ext_make_base_nop(&buffer[second]);
+        jit_ext_make_base_nop(&buffer[second + 1]);
+        jit_ext_make_base_nop(&buffer[second + 2]);
+
+        if (first_plan->provider->free_plan != NULL) {
+            first_plan->provider->free_plan(first_plan);
+            second_plan->provider->free_plan(second_plan);
+        }
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_PLAN_SUCCESS);
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_EMIT_UOP);
+        jit_ext_dump_fusion_candidate(buffer, length, first, second,
+                                      "pre_ra_right_fused_success");
+    }
+    return 0;
+}
+
+static int
+jit_ext_is_forbidden_unallocated_fused_rewrite_opcode(uint16_t opcode)
+{
+    return opcode == _EXT_FUSED_BINARY2_EXEC ||
+           opcode == _EXT_FUSED_BINARY2_RIGHT_EXEC ||
+           opcode == _NOP ||
+           opcode == _LOAD_FAST_BORROW ||
+           opcode == _CHECK_VALIDITY ||
+           opcode == _SET_IP ||
+           opcode == _POP_TOP_NOP;
+}
+
+static int
+jit_ext_verify_allocated_opcode(_PyUOpInstruction *buffer, int index)
+{
+    _PyUOpInstruction *inst = &buffer[index];
+    uint16_t base = inst->opcode <= MAX_UOP_REGS_ID ?
+        _PyUop_Uncached[inst->opcode] : 0;
+    if (base == 0) {
+        base = inst->opcode;
+    }
+    if (jit_ext_is_forbidden_unallocated_fused_rewrite_opcode(inst->opcode)) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: unallocated opcode at index %d (%s)",
+                     index,
+                     inst->opcode <= MAX_UOP_REGS_ID &&
+                     _PyOpcode_uop_name[inst->opcode] != NULL ?
+                     _PyOpcode_uop_name[inst->opcode] : "?");
+        return -1;
+    }
+    if (jit_ext_is_forbidden_unallocated_fused_rewrite_opcode(base) &&
+        base == inst->opcode) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: base opcode at index %d (%s)",
+                     index,
+                     base <= MAX_UOP_REGS_ID && _PyOpcode_uop_name[base] != NULL ?
+                     _PyOpcode_uop_name[base] : "?");
+        return -1;
+    }
+#ifdef _Py_JIT
+    if (!_PyJIT_UopHasStencil(inst->opcode)) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: missing JIT stencil at index %d for %s (%d)",
+                     index,
+                     inst->opcode <= MAX_UOP_REGS_ID &&
+                     _PyOpcode_uop_name[inst->opcode] != NULL ?
+                     _PyOpcode_uop_name[inst->opcode] : "?",
+                     inst->opcode);
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+static int
+jit_ext_verify_cache_suffix(_PyUOpInstruction *buffer, int index,
+                            int expected_inputs, int expected_outputs)
+{
+    int cache_inputs = -1;
+    int cache_outputs = -1;
+    if (!jit_ext_parse_cache_suffix(buffer[index].opcode,
+                                    &cache_inputs, &cache_outputs) ||
+        cache_inputs != expected_inputs ||
+        cache_outputs != expected_outputs) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: cache variant mismatch at index %d"
+                     " (expected r%d%d, got %s)",
+                     index, expected_outputs, expected_inputs,
+                     buffer[index].opcode <= MAX_UOP_REGS_ID &&
+                     _PyOpcode_uop_name[buffer[index].opcode] != NULL ?
+                     _PyOpcode_uop_name[buffer[index].opcode] : "?");
+        return -1;
+    }
+    return 0;
+}
+
+static int
+verify_fused_binary2_rewrite(_PyUOpInstruction *buffer, int length,
+                             int fused_index)
+{
+    if (!jit_ext_fused_debug_enabled()) {
+        return 0;
+    }
+    if (fused_index < 3 || fused_index + 7 >= length) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: fused index %d out of range",
+                     fused_index);
+        return -1;
+    }
+    int first = fused_index - 3;
+    int last = fused_index + 7;
+    for (int i = first; i <= last; i++) {
+        if (jit_ext_verify_allocated_opcode(buffer, i) < 0) {
+            return -1;
+        }
+    }
+    if (!jit_ext_is_base_uop(&buffer[fused_index - 3], _CHECK_VALIDITY) ||
+        !jit_ext_is_load_fast_borrow_uop(&buffer[fused_index - 2]) ||
+        !jit_ext_is_base_uop(&buffer[fused_index - 1], _SET_IP) ||
+        !jit_ext_is_base_uop(&buffer[fused_index], _EXT_FUSED_BINARY2_EXEC) ||
+        !jit_ext_is_base_uop(&buffer[fused_index + 1], _POP_TOP_NOP) ||
+        !jit_ext_is_base_uop(&buffer[fused_index + 2], _POP_TOP_NOP) ||
+        !jit_ext_is_base_uop(&buffer[fused_index + 3], _POP_TOP_NOP) ||
+        !jit_ext_is_base_uop(&buffer[fused_index + 4], _NOP) ||
+        !jit_ext_is_base_uop(&buffer[fused_index + 5], _NOP) ||
+        !jit_ext_is_base_uop(&buffer[fused_index + 6], _NOP) ||
+        !jit_ext_is_base_uop(&buffer[fused_index + 7], _NOP)) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: unexpected opcode layout around index %d",
+                     fused_index);
+        return -1;
+    }
+    if (jit_ext_verify_cache_suffix(buffer, fused_index - 3, 2, 2) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index - 2, 2, 3) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index - 1, 3, 3) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index, 3, 3) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index + 1, 3, 2) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index + 2, 2, 1) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index + 3, 1, 0) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index + 4, 0, 0) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index + 5, 0, 0) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index + 6, 0, 0) < 0 ||
+        jit_ext_verify_cache_suffix(buffer, fused_index + 7, 0, 0) < 0) {
+        return -1;
+    }
+    PyJitExtPlan *fused_plan = ext_plan_from_uop(&buffer[fused_index]);
+    if (fused_plan == NULL || fused_plan->kind != PYJIT_EXT_PLAN_FUSED_BINARY2) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: fused uop at index %d has no fused plan",
+                     fused_index);
+        return -1;
+    }
+    PyJitExtPlan *second_plan = ext_plan_from_uop(&buffer[fused_index + 4]);
+    if (second_plan != NULL) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid fused binary2 rewrite: original second binary exec still has a plan at index %d",
+                     fused_index + 4);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+jit_ext_try_fuse_binary2(_PyUOpInstruction *buffer, int length)
+{
+    int fusion_enabled = Py_GETENV("PYTHON_JIT_EXT_ENABLE_FUSED_BINARY2") != NULL;
+    int candidates_enabled = jit_ext_fusion_candidates_enabled();
+    if (!fusion_enabled && !candidates_enabled) {
+        return 0;
+    }
+    for (int i = 1; i + 9 < length; i++) {
+        if (!jit_ext_is_base_uop(&buffer[i], _EXT_BINARY_EXEC)) {
+            continue;
+        }
+        int next_binary = jit_ext_find_next_binary_exec(buffer, length, i);
+        if (!jit_ext_is_base_uop(&buffer[i - 1], _SET_IP) ||
+            !jit_ext_is_base_uop(&buffer[i + 1], _POP_TOP_NOP) ||
+            !jit_ext_is_base_uop(&buffer[i + 2], _POP_TOP_NOP) ||
+            !jit_ext_is_base_uop(&buffer[i + 3], _CHECK_VALIDITY) ||
+            !jit_ext_is_load_fast_borrow_uop(&buffer[i + 4]) ||
+            !jit_ext_is_base_uop(&buffer[i + 5], _SET_IP) ||
+            !jit_ext_is_base_uop(&buffer[i + 6], _EXT_BINARY_EXEC) ||
+            !jit_ext_is_base_uop(&buffer[i + 7], _POP_TOP_NOP) ||
+            !jit_ext_is_base_uop(&buffer[i + 8], _SPILL_OR_RELOAD) ||
+            !jit_ext_is_base_uop(&buffer[i + 9], _POP_TOP)) {
+            jit_ext_dump_fusion_candidate(buffer, length, i, next_binary,
+                                          "post_ra_shape_mismatch");
+            continue;
+        }
+        jit_ext_dump_fusion_candidate(buffer, length, i, i + 6,
+                                      "post_ra_shape_match");
+
+        if (!fusion_enabled) {
+            continue;
+        }
+
+        jit_ext_dump_fused_binary2_trace("before_fusion", buffer, length, i);
+
+        PyJitExtPlan *first_plan = ext_plan_from_uop(&buffer[i]);
+        PyJitExtPlan *second_plan = ext_plan_from_uop(&buffer[i + 6]);
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_VISIT);
+        if (first_plan == NULL || second_plan == NULL ||
+            first_plan->provider == NULL ||
+            first_plan->provider != second_plan->provider ||
+            first_plan->provider->try_plan == NULL) {
+            jit_ext_dump_fusion_candidate(buffer, length, i, i + 6,
+                                          "provider_mismatch_or_missing_plan");
+            continue;
+        }
+
+        PyJitExtTraceRequest request = {
+            .kind = PYJIT_EXT_TRACE_FUSED_BINARY2,
+            .u.fused_binary2 = {
+                .first_plan = first_plan,
+                .second_plan = second_plan,
+                .flags = PYJIT_EXT_FUSED_BINARY2_SECOND_CONSUMES_LEFT,
+            },
+        };
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_TRY_PLAN);
+        PyJitExtPlan *fused = first_plan->provider->try_plan(
+            &request, first_plan->site);
+        if (fused == NULL) {
+            if (PyErr_Occurred()) {
+                PyErr_Clear();
+            }
+            jit_ext_dump_fusion_candidate(buffer, length, i, i + 6,
+                                          "provider_reject");
+            continue;
+        }
+        jit_ext_dump_fusion_candidate(buffer, length, i, i + 6,
+                                      "fused_success");
+        fused->site = first_plan->site;
+
+        _PyUOpInstruction first_set_ip = buffer[i - 1];
+        _PyUOpInstruction first_ext = buffer[i];
+        _PyUOpInstruction validity = buffer[i + 3];
+        _PyUOpInstruction load_other = buffer[i + 4];
+        validity.opcode = _CHECK_VALIDITY_r22;
+        first_set_ip.opcode = _SET_IP_r33;
+        jit_ext_force_load_fast_borrow_r23(&load_other);
+
+        buffer[i - 1] = validity;
+        buffer[i] = load_other;
+        buffer[i + 1] = first_set_ip;
+        buffer[i + 2] = first_ext;
+        buffer[i + 2].opcode = _EXT_FUSED_BINARY2_EXEC_r33;
+        buffer[i + 2].oparg = 0;
+        buffer[i + 2].operand0 = (uintptr_t)fused;
+        buffer[i + 3].opcode = _POP_TOP_NOP_r32;
+        buffer[i + 4].opcode = _POP_TOP_NOP_r21;
+        buffer[i + 5].opcode = _POP_TOP_NOP_r10;
+        jit_ext_make_nop(&buffer[i + 6]);
+        jit_ext_make_nop(&buffer[i + 7]);
+        jit_ext_make_nop(&buffer[i + 8]);
+        jit_ext_make_nop(&buffer[i + 9]);
+
+        jit_ext_dump_fused_binary2_trace("after_fusion", buffer, length, i + 2);
+        if (verify_fused_binary2_rewrite(buffer, length, i + 2) < 0) {
+            if (first_plan->provider->free_plan != NULL) {
+                first_plan->provider->free_plan(first_plan);
+                second_plan->provider->free_plan(second_plan);
+            }
+            return -1;
+        }
+
+        if (first_plan->provider->free_plan != NULL) {
+            first_plan->provider->free_plan(first_plan);
+            second_plan->provider->free_plan(second_plan);
+        }
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_PLAN_SUCCESS);
+        _PyJit_RecordExtOptimizerEvent(
+            PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_EMIT_UOP);
+    }
+    return 0;
+}
+
 /* Makes an executor from a buffer of uops.
  * Account for the buffer having gaps and NOPs by computing a "used"
  * bit vector and only copying the used uops. Here "used" means reachable
@@ -1860,6 +3496,10 @@ free_ext_plans_from_uops(_PyUOpInstruction *buffer, int length)
 static _PyExecutorObject *
 make_executor_from_uops(_PyThreadStateImpl *tstate, _PyUOpInstruction *buffer, int length, const _PyBloomFilter *dependencies)
 {
+    if (jit_ext_try_fuse_binary2(buffer, length) < 0) {
+        free_ext_plans_from_uops(buffer, length);
+        return NULL;
+    }
     int exit_count = count_exits(buffer, length);
     _PyExecutorObject *executor = allocate_executor(exit_count, length);
     if (executor == NULL) {
@@ -1891,6 +3531,25 @@ make_executor_from_uops(_PyThreadStateImpl *tstate, _PyUOpInstruction *buffer, i
         }
         assert(next == ext_count);
         executor->ext_plan_count = ext_count;
+
+        for (Py_ssize_t i = 0; i < ext_count; i++) {
+            PyJitExtPlan *plan = executor->ext_plans[i];
+            if (plan == NULL) {
+                continue;
+            }
+            if (plan->kind == PYJIT_EXT_PLAN_BINARY) {
+                _PyJit_RecordExtOptimizerEvent(
+                    PYJIT_EXT_TRACE_BINARY, PYJIT_EXT_OPT_EXECUTOR_CREATED);
+            }
+            else if (plan->kind == PYJIT_EXT_PLAN_FUSED_BINARY2) {
+                _PyJit_RecordExtOptimizerEvent(
+                    PYJIT_EXT_TRACE_FUSED_BINARY2, PYJIT_EXT_OPT_EXECUTOR_CREATED);
+            }
+            else if (plan->kind == PYJIT_EXT_PLAN_CALL) {
+                _PyJit_RecordExtOptimizerEvent(
+                    PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_EXECUTOR_CREATED);
+            }
+        }
 
         for (int i = 0; i < length; i++) {
             PyJitExtPlan *plan = ext_plan_from_uop(&buffer[i]);
@@ -2095,6 +3754,10 @@ uop_optimize(
     code_buffer->next = code_buffer->start;
 
     OPT_HIST(effective_trace_length(buffer, length), optimized_trace_length_hist);
+    jit_ext_scan_pre_ra_fusion_candidates(buffer, length);
+    if (jit_ext_try_fuse_binary2_pre_ra(buffer, length) < 0) {
+        return -1;
+    }
     _PyUOpInstruction *output = &_tstate->jit_tracer_state->uop_array[0];
     length = stack_allocate(buffer, output, length);
     buffer = output;
@@ -2271,6 +3934,20 @@ executor_invalidate(PyObject *op)
     if (!executor->vm_data.valid) {
         return;
     }
+    for (Py_ssize_t i = 0; i < executor->ext_plan_count; i++) {
+        PyJitExtPlan *plan = executor->ext_plans[i];
+        if (plan == NULL) {
+            continue;
+        }
+        if (plan->kind == PYJIT_EXT_PLAN_BINARY) {
+            _PyJit_RecordExtOptimizerEvent(
+                PYJIT_EXT_TRACE_BINARY, PYJIT_EXT_OPT_EXECUTOR_INVALIDATED);
+        }
+        else if (plan->kind == PYJIT_EXT_PLAN_CALL) {
+            _PyJit_RecordExtOptimizerEvent(
+                PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_EXECUTOR_INVALIDATED);
+        }
+    }
     executor->vm_data.valid = 0;
     unlink_executor(executor);
     executor_clear_exits(executor);
@@ -2279,10 +3956,48 @@ executor_invalidate(PyObject *op)
 }
 
 void
+_PyJit_RecordExtHit(PyJitExtPlan *plan)
+{
+    if (plan == NULL || plan->site == NULL) {
+        return;
+    }
+    PyJitExtSiteState *site = plan->site;
+    if (site->hit_count != UINT16_MAX) {
+        site->hit_count++;
+    }
+    if (plan->kind == PYJIT_EXT_PLAN_FUSED_BINARY2 &&
+        site->fused_hit_count != UINT16_MAX) {
+        site->fused_hit_count++;
+    }
+    site->last_plan_op_id = plan->op_id;
+    site->last_provider = plan->provider;
+}
+
+void
 _Py_Executor_RecordExtMiss(_PyExecutorObject *executor, PyJitExtPlan *plan)
 {
-    if (plan != NULL) {
-        (void)plan;
+    if (plan != NULL && plan->site != NULL) {
+        PyJitExtSiteState *site = plan->site;
+        if (site->miss_count != UINT16_MAX) {
+            site->miss_count++;
+        }
+        if (plan->kind == PYJIT_EXT_PLAN_FUSED_BINARY2 &&
+            site->fused_miss_count != UINT16_MAX) {
+            site->fused_miss_count++;
+        }
+        site->last_plan_op_id = plan->op_id;
+        site->last_provider = plan->provider;
+        int miss_threshold = site->trace_kind == PYJIT_EXT_TRACE_BINARY ?
+            jit_ext_env_int("PYTHON_JIT_EXT_BINARY_DISABLE_MISSES", 8) :
+            jit_ext_env_int("PYTHON_JIT_EXT_CALL_DISABLE_MISSES", 3);
+        int min_hits = site->trace_kind == PYJIT_EXT_TRACE_BINARY ?
+            jit_ext_env_int("PYTHON_JIT_EXT_BINARY_DISABLE_MIN_HITS", 16) :
+            jit_ext_env_int("PYTHON_JIT_EXT_CALL_DISABLE_MIN_HITS", 8);
+        if (_PyJitExtEnableSiteDisable() && !site->disabled &&
+            site->miss_count >= miss_threshold && site->hit_count < min_hits) {
+            site->disabled = 1;
+            site->disable_reason = "miss_threshold";
+        }
     }
     executor_invalidate((PyObject *)executor);
 }

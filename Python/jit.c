@@ -641,6 +641,15 @@ combine_symbol_mask(const symbol_mask src, symbol_mask dest)
 
 // Compiles executor in-place. Don't forget to call _PyJIT_Free later!
 int
+_PyJIT_UopHasStencil(int opcode)
+{
+    if (opcode < 0 || opcode >= (int)Py_ARRAY_LENGTH(stencil_groups)) {
+        return 0;
+    }
+    return stencil_groups[opcode].emit != NULL;
+}
+
+int
 _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], size_t length)
 {
     const StencilGroup *group;
@@ -700,6 +709,11 @@ _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], siz
     for (size_t i = 0; i < length; i++) {
         const _PyUOpInstruction *instruction = &trace[i];
         group = &stencil_groups[instruction->opcode];
+        if (group->emit == NULL) {
+            PyErr_Format(PyExc_SystemError,
+                         "missing JIT stencil for uop %d", instruction->opcode);
+            return -1;
+        }
         group->emit(code, data, executor, instruction, &state);
         code += group->code_size;
         data += group->data_size;

@@ -215,7 +215,25 @@ PyAPI_FUNC(_PyExecutorObject*) _Py_GetExecutor(PyCodeObject *code, int offset);
 int _Py_ExecutorInit(_PyExecutorObject *, const _PyBloomFilter *);
 void _Py_ExecutorDetach(_PyExecutorObject *);
 PyAPI_FUNC(void) _Py_Executor_DependsOn(_PyExecutorObject *executor, void *obj);
+void _PyJit_RecordExtHit(PyJitExtPlan *plan);
 void _Py_Executor_RecordExtMiss(_PyExecutorObject *executor, PyJitExtPlan *plan);
+int _PyJitExtEnableSiteDisable(void);
+int _PyJitExtLookupOnly(void);
+int _PyJitExtPlanNoEmit(void);
+bool _PyJit_MaybeHasBinaryProviderForOparg(int binary_oparg);
+bool _PyJit_MaybeHasBinaryProviderForTypesOparg(
+    PyTypeObject *left_type, PyTypeObject *right_type, int binary_oparg);
+bool _PyJit_MaybeHasCallableProvider(PyObject *callable);
+void _PyJit_RecordExtOptimizerEvent(PyJitExtTraceKind kind,
+                                    PyJitExtOptimizerEvent event);
+void _PyJit_RecordExtBinaryAdmission(int binary_oparg,
+    PyTypeObject *left_type, PyTypeObject *right_type,
+    PyJitExtBinaryAdmissionReason reason);
+PyJitExtSiteState *_PyJit_GetExtSiteState(PyCodeObject *code, int target,
+    const PyJitExtTraceRequest *request, int create);
+void _PyJit_DumpExtSiteStats(PyInterpreterState *interp);
+void _PyJit_DumpExtOptimizerStats(PyInterpreterState *interp);
+void _PyJit_DumpExtBinaryAdmissionStats(PyInterpreterState *interp);
 
 /* We use a bloomfilter with k = 6, m = 256
  * The choice of k and the following constants

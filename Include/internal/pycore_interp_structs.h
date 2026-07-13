@@ -925,9 +925,21 @@ struct _is {
 
     PyObject *dict;  /* Stores per-interpreter state */
     PyObject *jit_binary_provider_registry;
+    uint64_t jit_binary_provider_oparg_mask;
+    PyTypeObject *jit_binary_provider_left_types[PYJIT_EXT_BINARY_PROVIDER_CACHE_MAX];
+    PyTypeObject *jit_binary_provider_right_types[PYJIT_EXT_BINARY_PROVIDER_CACHE_MAX];
+    int jit_binary_provider_opargs[PYJIT_EXT_BINARY_PROVIDER_CACHE_MAX];
+    uint8_t jit_binary_provider_cache_count;
+    uint8_t jit_binary_provider_cache_overflow;
     PyMutex jit_binary_provider_registry_mutex;
     PyObject *jit_callable_provider_registry;
+    PyObject *jit_callable_provider_callables[PYJIT_EXT_CALLABLE_PROVIDER_CACHE_MAX];
+    uint8_t jit_callable_provider_cache_count;
+    uint8_t jit_callable_provider_cache_overflow;
     PyMutex jit_callable_provider_registry_mutex;
+    PyObject *jit_ext_site_registry;
+    PyMutex jit_ext_site_registry_mutex;
+    uint64_t jit_ext_optimizer_counts[PYJIT_EXT_TRACE_FUSED_BINARY2 + 1][PYJIT_EXT_OPT_EVENT_COUNT];
 
     PyObject *sysdict_copy;
     PyObject *builtins_copy;

@@ -39,6 +39,33 @@
 #include <stdint.h>
 #include <stddef.h>
 
+static int
+_PyJitExtEnvFlag(const char *name)
+{
+    char *value = Py_GETENV(name);
+    return value == NULL || value[0] != '0';
+}
+
+static int
+_PyJitExtEnableBinary(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = _PyJitExtEnvFlag("PYTHON_JIT_EXT_ENABLE_BINARY");
+    }
+    return enabled;
+}
+
+static int
+_PyJitExtEnableCall(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = _PyJitExtEnvFlag("PYTHON_JIT_EXT_ENABLE_CALL");
+    }
+    return enabled;
+}
+
 #ifdef Py_DEBUG
     extern const char *_PyUOpName(int index);
     extern void _PyUOpPrint(const _PyUOpInstruction *uop);

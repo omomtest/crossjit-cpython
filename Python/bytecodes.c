@@ -793,10 +793,69 @@ dummy_func(
             if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
                 ERROR_NO_POP();
             }
+            _PyJit_RecordExtHit(plan);
 
             res = PyStackRef_FromPyObjectSteal(res_o);
             l = left;
             r = right;
+            INPUTS_DEAD();
+        }
+
+        op(_EXT_FUSED_BINARY2_EXEC, (plan_index/1, first_left, first_right, second_other -- res, l, r, o)) {
+            EXIT_IF(plan_index >= current_executor->ext_plan_count);
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            PyObject *first_left_o = PyStackRef_AsPyObjectBorrow(first_left);
+            PyObject *first_right_o = PyStackRef_AsPyObjectBorrow(first_right);
+            PyObject *second_other_o = PyStackRef_AsPyObjectBorrow(second_other);
+            EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_FUSED_BINARY2 ||
+                    plan->eval.fused_binary2_eval == NULL);
+
+            PyObject *res_o = NULL;
+            PyJitExtResult jit_res = plan->eval.fused_binary2_eval(
+                plan->payload, first_left_o, first_right_o, second_other_o,
+                &res_o);
+            if (jit_res == PYJIT_EXT_MISS) {
+                _Py_Executor_RecordExtMiss(current_executor, plan);
+                EXIT_IF(true);
+            }
+            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
+                ERROR_NO_POP();
+            }
+            _PyJit_RecordExtHit(plan);
+
+            res = PyStackRef_FromPyObjectSteal(res_o);
+            l = first_left;
+            r = first_right;
+            o = second_other;
+            INPUTS_DEAD();
+        }
+
+        op(_EXT_FUSED_BINARY2_RIGHT_EXEC, (plan_index/1, second_other, first_left, first_right -- res, o, l, r)) {
+            EXIT_IF(plan_index >= current_executor->ext_plan_count);
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            PyObject *first_left_o = PyStackRef_AsPyObjectBorrow(first_left);
+            PyObject *first_right_o = PyStackRef_AsPyObjectBorrow(first_right);
+            PyObject *second_other_o = PyStackRef_AsPyObjectBorrow(second_other);
+            EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_FUSED_BINARY2 ||
+                    plan->eval.fused_binary2_eval == NULL);
+
+            PyObject *res_o = NULL;
+            PyJitExtResult jit_res = plan->eval.fused_binary2_eval(
+                plan->payload, first_left_o, first_right_o, second_other_o,
+                &res_o);
+            if (jit_res == PYJIT_EXT_MISS) {
+                _Py_Executor_RecordExtMiss(current_executor, plan);
+                EXIT_IF(true);
+            }
+            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
+                ERROR_NO_POP();
+            }
+            _PyJit_RecordExtHit(plan);
+
+            res = PyStackRef_FromPyObjectSteal(res_o);
+            o = second_other;
+            l = first_left;
+            r = first_right;
             INPUTS_DEAD();
         }
 
@@ -836,6 +895,7 @@ dummy_func(
             if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
                 ERROR_NO_POP();
             }
+            _PyJit_RecordExtHit(plan);
 
             INPUTS_DEAD();
             res = PyStackRef_FromPyObjectSteal(res_o);
