@@ -679,6 +679,11 @@ jit_ext_stencil_for_instruction(_PyExecutorObject *executor,
                             sizeof(plan->stencil)) {
         return NULL;
     }
+    if (plan->struct_size >= offsetof(PyJitExtPlan, get_stencil) +
+                             sizeof(plan->get_stencil) &&
+        plan->get_stencil != NULL) {
+        return plan->get_stencil(plan, instruction->opcode);
+    }
     return plan->stencil;
 }
 
@@ -706,17 +711,21 @@ jit_ext_stencil_hole_value(const PyJitExtStencilHole *hole,
         case PYJIT_EXT_STENCIL_VALUE_NEXT_INSTRUCTION:
             return state->instruction_starts[instruction_index] + code_size;
         case PYJIT_EXT_STENCIL_VALUE_TARGET:
-            if (instruction->target >= trace_length) {
+            if (instruction->jump_target >= trace_length) {
                 *ok = 0;
                 return 0;
             }
-            return state->instruction_starts[instruction->target];
+            return state->instruction_starts[instruction->jump_target];
         case PYJIT_EXT_STENCIL_VALUE_ERROR_TARGET:
             if (instruction->error_target >= trace_length) {
                 *ok = 0;
                 return 0;
             }
             return state->instruction_starts[instruction->error_target];
+        case PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_HIT:
+            return (uintptr_t)_PyJit_RecordExtHit;
+        case PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_MISS:
+            return (uintptr_t)_Py_Executor_RecordExtMiss;
         default:
             *ok = 0;
             return 0;

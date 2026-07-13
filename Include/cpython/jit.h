@@ -127,6 +127,8 @@ typedef enum {
     PYJIT_EXT_STENCIL_VALUE_NEXT_INSTRUCTION,
     PYJIT_EXT_STENCIL_VALUE_TARGET,
     PYJIT_EXT_STENCIL_VALUE_ERROR_TARGET,
+    PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_HIT,
+    PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_MISS,
 } PyJitExtStencilValueKind;
 
 typedef enum {
@@ -154,6 +156,10 @@ typedef struct {
     size_t hole_count;
 } PyJitExtStencil;
 
+typedef const PyJitExtStencil *(*PyJitExtGetStencilFunc)(
+    const PyJitExtPlan *plan,
+    int opcode);
+
 struct _PyJitExtPlan {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -171,6 +177,7 @@ struct _PyJitExtPlan {
     const char *debug_name;
     PyJitExtSiteState *site;
     const PyJitExtStencil *stencil;
+    PyJitExtGetStencilFunc get_stencil;
 };
 
 #define PYJIT_EXT_PLAN_REQUIRES_GIL          (1u << 0)
