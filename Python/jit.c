@@ -651,6 +651,7 @@ jit_ext_is_external_uop(uint16_t opcode)
     return base_opcode == _EXT_BINARY_EXEC ||
            base_opcode == _EXT_FUSED_BINARY2_EXEC ||
            base_opcode == _EXT_FUSED_BINARY2_RIGHT_EXEC ||
+           base_opcode == _EXT_REGION_EXEC ||
            base_opcode == _EXT_CALL_EXEC;
 }
 
@@ -709,6 +710,10 @@ jit_ext_stencil_hole_value(const PyJitExtStencilHole *hole,
             return (uintptr_t)plan->eval.call_eval;
         case PYJIT_EXT_STENCIL_VALUE_FUSED_BINARY2_EVAL:
             return (uintptr_t)plan->eval.fused_binary2_eval;
+        case PYJIT_EXT_STENCIL_VALUE_REGION_EVAL:
+            return (uintptr_t)plan->eval.region_eval;
+        case PYJIT_EXT_STENCIL_VALUE_REGION_FALLBACK_EVAL:
+            return (uintptr_t)plan->region_fallback_eval;
         case PYJIT_EXT_STENCIL_VALUE_NEXT_INSTRUCTION:
             return state->instruction_starts[instruction_index] + code_size;
         case PYJIT_EXT_STENCIL_VALUE_TARGET:
@@ -757,7 +762,12 @@ jit_ext_emit_stencil(unsigned char *code, unsigned char *data,
         (stencil->code_size != 0 && stencil->code == NULL) ||
         (stencil->data_size != 0 && stencil->data == NULL) ||
         (stencil->hole_count != 0 && stencil->holes == NULL)) {
-        PyErr_SetString(PyExc_SystemError, "invalid external JIT stencil");
+        PyErr_Format(
+            PyExc_SystemError,
+            "invalid external JIT stencil (opcode=%u plan=%p kind=%d stencil=%p abi=%u)",
+            (unsigned)instruction->opcode, (void *)plan,
+            plan != NULL ? (int)plan->kind : -1, (void *)stencil,
+            stencil != NULL ? stencil->abi_version : 0);
         return -1;
     }
     if (stencil->code_size != 0) {

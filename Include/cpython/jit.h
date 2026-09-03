@@ -13,9 +13,16 @@ extern "C" {
  * plan payloads and run their own guards, allocation, and kernels from eval().
  */
 
-#define PYJIT_EXT_ABI_VERSION 2u
+#define PYJIT_EXT_ABI_VERSION 5u
+
+#define PYJIT_EXT_REGION_MAX_NODES 4
+#define PYJIT_EXT_REGION_MAX_INPUTS 6
+#define PYJIT_EXT_REGION_MAX_NODE_INPUTS 3
+#define PYJIT_EXT_REGION_PIC_SIZE 4
+#define PYJIT_EXT_UNARY_NEGATIVE 1
 
 typedef enum {
+    PYJIT_EXT_COLD = 2,
     PYJIT_EXT_HIT = 1,
     PYJIT_EXT_MISS = 0,
     PYJIT_EXT_ERROR = -1,
@@ -25,11 +32,61 @@ typedef enum {
     PYJIT_EXT_TRACE_BINARY,
     PYJIT_EXT_TRACE_CALL,
     PYJIT_EXT_TRACE_FUSED_BINARY2,
+    PYJIT_EXT_TRACE_REGION,
+    PYJIT_EXT_TRACE_UNARY,
 } PyJitExtTraceKind;
 
 typedef struct _PyJitExtProvider PyJitExtProvider;
 typedef struct _PyJitExtPlan PyJitExtPlan;
 typedef struct _PyJitExtSiteState PyJitExtSiteState;
+typedef struct _PyJitExtLoweredRegion PyJitExtLoweredRegion;
+
+typedef uint16_t PyJitExtValueId;
+
+typedef struct {
+    PyJitExtValueId value_id;
+    PyTypeObject *type;
+    uint32_t flags;
+} PyJitExtRegionInput;
+
+typedef struct {
+    const PyJitExtPlan *atomic_plan;
+    uint32_t semantic_id;
+    uint32_t effect_flags;
+    PyJitExtValueId inputs[PYJIT_EXT_REGION_MAX_NODE_INPUTS];
+    uint8_t input_count;
+    PyJitExtValueId output;
+    uint32_t bytecode_target;
+} PyJitExtRegionNode;
+
+typedef struct {
+    PyJitExtProvider *provider;
+    const PyJitExtRegionInput *inputs;
+    uint8_t input_count;
+    const PyJitExtRegionNode *nodes;
+    uint8_t node_count;
+    PyJitExtValueId output;
+    uint32_t first_target;
+    uint32_t last_target;
+    uint64_t graph_hash;
+    uint32_t flags;
+} PyJitExtRegionRequest;
+
+typedef PyJitExtResult (*PyJitExtRegionEvalFunc)(
+    void *payload,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    PyObject **result);
+
+struct _PyJitExtLoweredRegion {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint64_t property_signature;
+    uint32_t flags;
+    void *payload;
+    PyJitExtRegionEvalFunc guard_eval;
+    const char *debug_name;
+};
 
 typedef struct {
     PyJitExtTraceKind kind;
@@ -39,6 +96,10 @@ typedef struct {
             PyTypeObject *left_type;
             PyTypeObject *right_type;
         } binary;
+        struct {
+            int unary_opcode;
+            PyTypeObject *operand_type;
+        } unary;
         struct {
             PyObject *callable;
             Py_ssize_t nargs;
@@ -50,6 +111,7 @@ typedef struct {
             PyJitExtPlan *second_plan;
             uint32_t flags;
         } fused_binary2;
+        PyJitExtRegionRequest region;
     } u;
 } PyJitExtTraceRequest;
 
@@ -85,13 +147,34 @@ struct _PyJitExtProvider {
     int (*describe_plan)(
         const PyJitExtPlan *plan,
         PyJitExtPlanInfo *info);
+    PyJitExtPlan *(*prepare_region)(
+        const PyJitExtRegionRequest *request,
+        PyJitExtSiteState *site);
+    PyJitExtResult (*region_property_signature)(
+        const PyJitExtPlan *region,
+        PyObject *const *args,
+        Py_ssize_t nargs,
+        uint64_t *signature);
+    PyJitExtLoweredRegion *(*specialize_region)(
+        const PyJitExtPlan *region,
+        PyObject *const *args,
+        Py_ssize_t nargs,
+        uint64_t signature);
+    void (*free_lowered_region)(PyJitExtLoweredRegion *lowered);
 };
 
 typedef enum {
     PYJIT_EXT_PLAN_BINARY,
     PYJIT_EXT_PLAN_CALL,
     PYJIT_EXT_PLAN_FUSED_BINARY2,
+    PYJIT_EXT_PLAN_REGION,
+    PYJIT_EXT_PLAN_UNARY,
 } PyJitExtPlanKind;
+
+typedef PyJitExtResult (*PyJitExtUnaryEvalFunc)(
+    void *payload,
+    PyObject *operand,
+    PyObject **result);
 
 typedef PyJitExtResult (*PyJitExtBinaryEvalFunc)(
     void *payload,
@@ -124,6 +207,8 @@ typedef enum {
     PYJIT_EXT_STENCIL_VALUE_BINARY_EVAL,
     PYJIT_EXT_STENCIL_VALUE_CALL_EVAL,
     PYJIT_EXT_STENCIL_VALUE_FUSED_BINARY2_EVAL,
+    PYJIT_EXT_STENCIL_VALUE_REGION_EVAL,
+    PYJIT_EXT_STENCIL_VALUE_REGION_FALLBACK_EVAL,
     PYJIT_EXT_STENCIL_VALUE_NEXT_INSTRUCTION,
     PYJIT_EXT_STENCIL_VALUE_TARGET,
     PYJIT_EXT_STENCIL_VALUE_ERROR_TARGET,
@@ -180,12 +265,18 @@ struct _PyJitExtPlan {
         PyJitExtBinaryEvalFunc binary_eval;
         PyJitExtCallEvalFunc call_eval;
         PyJitExtFusedBinary2EvalFunc fused_binary2_eval;
+        PyJitExtRegionEvalFunc region_eval;
+        PyJitExtUnaryEvalFunc unary_eval;
     } eval;
     void (*free_payload)(void *payload);
     const char *debug_name;
     PyJitExtSiteState *site;
     const PyJitExtStencil *stencil;
     PyJitExtGetStencilFunc get_stencil;
+    PyJitExtRegionEvalFunc region_fallback_eval;
+    uint32_t effect_flags;
+    int8_t mutation_input;
+    uint8_t region_input_count;
 };
 
 #define PYJIT_EXT_PLAN_REQUIRES_GIL          (1u << 0)
@@ -195,6 +286,14 @@ struct _PyJitExtPlan {
 #define PYJIT_EXT_PLAN_DEVICE_ASYNC          (1u << 4)
 #define PYJIT_EXT_PLAN_NEEDS_SYNC_ON_DEOPT   (1u << 5)
 #define PYJIT_EXT_PLAN_OPAQUE_EFFECTS        (1u << 6)
+#define PYJIT_EXT_PLAN_REGION_ANCHOR_ONLY    (1u << 7)
+
+#define PYJIT_EXT_EFFECT_PURE                (1u << 0)
+#define PYJIT_EXT_EFFECT_NO_PYTHON_CALLBACK  (1u << 1)
+#define PYJIT_EXT_EFFECT_MUTATES_INPUT       (1u << 2)
+#define PYJIT_EXT_EFFECT_FAST_MATH           (1u << 3)
+#define PYJIT_EXT_EFFECT_PRESERVES_FP_POLICY (1u << 4)
+#define PYJIT_EXT_EFFECT_OWNS_ATOMIC_PLANS   (1u << 5)
 
 #define PYJIT_EXT_GUARD_FAIL_REASON_COUNT 9
 #define PYJIT_EXT_BINARY_PROVIDER_CACHE_MAX 64
@@ -263,6 +362,23 @@ struct _PyJitExtSiteState {
     uint16_t fused_hit_count;
     uint16_t fused_miss_count;
     const char *fused_pattern;
+    uint16_t region_site_count;
+    uint16_t region_hit_count;
+    uint16_t region_fallback_count;
+    uint16_t region_error_count;
+    uint8_t region_node_count;
+    uint8_t region_input_count;
+    uint64_t region_graph_hash;
+    uint8_t region_disabled;
+    const char *region_disable_reason;
+    uint16_t region_pic_hit_count;
+    uint16_t region_pic_miss_count;
+    uint16_t region_specialize_count;
+    uint16_t region_specialize_decline_count;
+    uint16_t region_negative_count;
+    uint16_t region_saturated_count;
+    const char *region_lowering_name;
+    const char *region_guard_fail_reason;
 };
 
 #define PYJIT_CALL_HAS_KWARGS        (1u << 0)
@@ -281,6 +397,17 @@ PyAPI_FUNC(PyJitExtProvider *) PyJit_LookupBinaryProvider(
     PyTypeObject *left_type,
     PyTypeObject *right_type,
     int binary_oparg);
+
+PyAPI_FUNC(int) PyJit_RegisterUnaryProvider(
+    PyTypeObject *operand_type,
+    int unary_opcode,
+    PyJitExtProvider *provider);
+PyAPI_FUNC(int) PyJit_UnregisterUnaryProvider(
+    PyTypeObject *operand_type,
+    int unary_opcode);
+PyAPI_FUNC(PyJitExtProvider *) PyJit_LookupUnaryProvider(
+    PyTypeObject *operand_type,
+    int unary_opcode);
 
 PyAPI_FUNC(int) PyJit_RegisterCallableProvider(
     PyObject *callable,

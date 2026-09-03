@@ -5461,6 +5461,93 @@
             break;
         }
 
+        case _EXT_REGION_EXEC_r01: {
+            CHECK_CURRENT_CACHED_VALUES(0);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            _PyStackRef *args;
+            _PyStackRef res;
+            oparg = CURRENT_OPARG();
+            args = &stack_pointer[-oparg];
+            uint16_t plan_index = (uint16_t)CURRENT_OPERAND0_16();
+            if (plan_index >= current_executor->ext_plan_count) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            if (plan == NULL || plan->kind != PYJIT_EXT_PLAN_REGION ||
+                    plan->eval.region_eval == NULL ||
+                    oparg != plan->region_input_count ||
+                    oparg > PYJIT_EXT_REGION_MAX_INPUTS) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyObject *args_o[PYJIT_EXT_REGION_MAX_INPUTS];
+            for (int i = 0; i < oparg; i++) {
+                args_o[i] = PyStackRef_AsPyObjectBorrow(args[i]);
+            }
+            PyObject *res_o = NULL;
+            int fast_hit = 1;
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            PyJitExtResult jit_res = plan->eval.region_eval(
+                plan->payload, (PyObject *const *)args_o, oparg, &res_o);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (jit_res == PYJIT_EXT_COLD) {
+                fast_hit = 0;
+                if (plan->site != NULL &&
+                    plan->site->region_fallback_count != UINT16_MAX) {
+                    plan->site->region_fallback_count++;
+                }
+            }
+            else if (jit_res == PYJIT_EXT_MISS) {
+                fast_hit = 0;
+                _PyFrame_SetStackPointer(frame, stack_pointer);
+                _Py_Executor_RecordExtMiss(current_executor, plan);
+                stack_pointer = _PyFrame_GetStackPointer(frame);
+                if (plan->site != NULL &&
+                    plan->site->region_fallback_count != UINT16_MAX) {
+                    plan->site->region_fallback_count++;
+                }
+                if (plan->region_fallback_eval == NULL) {
+                    if (true) {
+                        UOP_STAT_INC(uopcode, miss);
+                        SET_CURRENT_CACHED_VALUES(0);
+                        JUMP_TO_JUMP_TARGET();
+                    }
+                }
+                _PyFrame_SetStackPointer(frame, stack_pointer);
+                jit_res = plan->region_fallback_eval(
+                    plan->payload, (PyObject *const *)args_o, oparg, &res_o);
+                stack_pointer = _PyFrame_GetStackPointer(frame);
+            }
+            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
+                if (plan->site != NULL &&
+                    plan->site->region_error_count != UINT16_MAX) {
+                    plan->site->region_error_count++;
+                }
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_ERROR();
+            }
+            if (fast_hit) {
+                _PyFrame_SetStackPointer(frame, stack_pointer);
+                _PyJit_RecordExtHit(plan);
+                stack_pointer = _PyFrame_GetStackPointer(frame);
+            }
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            _PyStackRef_CloseStack(args, oparg);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            res = PyStackRef_FromPyObjectSteal(res_o);
+            _tos_cache0 = res;
+            _tos_cache1 = PyStackRef_ZERO_BITS;
+            _tos_cache2 = PyStackRef_ZERO_BITS;
+            SET_CURRENT_CACHED_VALUES(1);
+            stack_pointer += -oparg;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            break;
+        }
+
         case _EXT_CALL_EXEC_r01: {
             CHECK_CURRENT_CACHED_VALUES(0);
             assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());

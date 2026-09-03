@@ -932,6 +932,8 @@ struct _is {
     uint8_t jit_binary_provider_cache_count;
     uint8_t jit_binary_provider_cache_overflow;
     PyMutex jit_binary_provider_registry_mutex;
+    PyObject *jit_unary_provider_registry;
+    PyMutex jit_unary_provider_registry_mutex;
     PyObject *jit_callable_provider_registry;
     PyObject *jit_callable_provider_callables[PYJIT_EXT_CALLABLE_PROVIDER_CACHE_MAX];
     uint8_t jit_callable_provider_cache_count;
@@ -939,7 +941,7 @@ struct _is {
     PyMutex jit_callable_provider_registry_mutex;
     PyObject *jit_ext_site_registry;
     PyMutex jit_ext_site_registry_mutex;
-    uint64_t jit_ext_optimizer_counts[PYJIT_EXT_TRACE_FUSED_BINARY2 + 1][PYJIT_EXT_OPT_EVENT_COUNT];
+    uint64_t jit_ext_optimizer_counts[PYJIT_EXT_TRACE_REGION + 1][PYJIT_EXT_OPT_EVENT_COUNT];
 
     PyObject *sysdict_copy;
     PyObject *builtins_copy;

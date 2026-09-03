@@ -427,7 +427,12 @@ dummy_func(void) {
                                     oparg, left_type, right_type,
                                     PYJIT_EXT_BINARY_ADMISSION_EMIT_EXTERNAL_UOP);
                                 ADD_OP(_EXT_BINARY_EXEC, 0, (uintptr_t)plan);
-                                REPLACE_OPCODE_IF_EVALUATES_PURE(lhs, rhs, res);
+                                if (oparg != NB_INPLACE_ADD &&
+                                    oparg != NB_INPLACE_SUBTRACT &&
+                                    oparg != NB_INPLACE_MULTIPLY &&
+                                    oparg != NB_INPLACE_TRUE_DIVIDE) {
+                                    REPLACE_OPCODE_IF_EVALUATES_PURE(lhs, rhs, res);
+                                }
                                 handled = true;
                             }
                         }
@@ -893,13 +898,46 @@ dummy_func(void) {
 
     op(_UNARY_NEGATIVE, (value -- res, v)) {
         v = value;
-        REPLACE_OPCODE_IF_EVALUATES_PURE(value, res);
-        if (sym_matches_type(value, &PyFloat_Type) && PyJitRef_IsUnique(value)) {
+        bool external_anchor = false;
+        PyTypeObject *operand_type = sym_get_type(value);
+        if (operand_type == NULL) {
+            operand_type = sym_get_probable_type(value);
+        }
+        PyJitExtProvider *provider = PyJit_LookupUnaryProvider(
+            operand_type, PYJIT_EXT_UNARY_NEGATIVE);
+        if (provider != NULL && !_PyJitExtLookupOnly()) {
+            PyJitExtTraceRequest request = {
+                .kind = PYJIT_EXT_TRACE_UNARY,
+                .u.unary = {
+                    .unary_opcode = PYJIT_EXT_UNARY_NEGATIVE,
+                    .operand_type = operand_type,
+                },
+            };
+            PyCodeObject *code = get_current_code_object(ctx);
+            PyJitExtSiteState *site = _PyJit_GetExtSiteState(
+                code, this_instr->target, &request, 1);
+            PyJitExtPlan *plan = site != NULL ?
+                provider->try_plan(&request, site) : NULL;
+            if (plan != NULL) {
+                plan->site = site;
+                if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                    provider->free_plan(plan);
+                    ctx->done = true;
+                    break;
+                }
+                ADD_OP(_UNARY_NEGATIVE, 0, (uintptr_t)plan);
+                external_anchor = true;
+            }
+        }
+        if (!external_anchor) {
+            REPLACE_OPCODE_IF_EVALUATES_PURE(value, res);
+        }
+        if (!external_anchor && sym_matches_type(value, &PyFloat_Type) && PyJitRef_IsUnique(value)) {
             ADD_OP(_UNARY_NEGATIVE_FLOAT_INPLACE, 0, 0);
             v = PyJitRef_Borrow(sym_new_null(ctx));
             res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
         }
-        else if (sym_is_compact_int(value)) {
+        else if (!external_anchor && sym_is_compact_int(value)) {
             res = sym_new_compact_int(ctx);
         }
         else {
