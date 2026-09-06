@@ -268,7 +268,15 @@ _PyJit_MaybeHasCallableProvider(PyObject *callable)
     if (interp->jit_callable_provider_cache_overflow) {
         return true;
     }
-    return jit_callable_provider_cache_find(interp, callable) >= 0;
+    if (jit_callable_provider_cache_find(interp, callable) >= 0) {
+        return true;
+    }
+    if (PyCFunction_Check(callable)) {
+        PyObject *receiver = PyCFunction_GET_SELF(callable);
+        return receiver != NULL &&
+               jit_callable_provider_cache_find(interp, receiver) >= 0;
+    }
+    return false;
 }
 
 static PyObject *
@@ -391,6 +399,10 @@ jit_ext_site_capsule_destructor(PyObject *capsule)
 {
     PyJitExtSiteState *site = PyCapsule_GetPointer(capsule, PYJIT_EXT_SITE_CAPSULE);
     if (site != NULL) {
+        if (site->provider_data != NULL &&
+            site->free_provider_data != NULL) {
+            site->free_provider_data(site->provider_data);
+        }
         PyMem_Free(site);
     }
     else {
@@ -612,6 +624,7 @@ _PyJit_DumpExtSiteStats(PyInterpreterState *interp)
                 "\"region_node_count\":%u,"
                 "\"region_input_count\":%u,"
                 "\"region_graph_hash\":%" PRIu64 ","
+                "\"region_op_signature\":%" PRIu64 ","
                 "\"region_disabled\":%u,"
                 "\"region_disable_reason\":\"%s\","
                 "\"region_pic_hit_count\":%u,"
@@ -645,6 +658,7 @@ _PyJit_DumpExtSiteStats(PyInterpreterState *interp)
                 (unsigned)site->region_node_count,
                 (unsigned)site->region_input_count,
                 site->region_graph_hash,
+                site->region_op_signature,
                 (unsigned)site->region_disabled,
                 site->region_disable_reason != NULL ?
                     site->region_disable_reason : "",
@@ -983,6 +997,61 @@ PyJit_LookupBinaryProvider(PyTypeObject *left_type,
     return jit_provider_from_capsule(capsule);
 }
 
+PyJitExtProvider *
+_PyJit_LookupBinaryProviderForKnownTypes(PyTypeObject *left_type,
+                                         PyTypeObject *right_type,
+                                         int binary_oparg)
+{
+    if (left_type != NULL && right_type != NULL) {
+        return PyJit_LookupBinaryProvider(
+            left_type, right_type, binary_oparg);
+    }
+    if (left_type == NULL && right_type == NULL) {
+        return NULL;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (tstate == NULL) {
+        return NULL;
+    }
+    PyObject *registry = jit_binary_provider_registry_get(tstate->interp, 0);
+    if (registry == NULL) {
+        return NULL;
+    }
+    PyJitExtProvider *match = NULL;
+    Py_ssize_t pos = 0;
+    PyObject *key;
+    PyObject *capsule;
+    while (PyDict_Next(registry, &pos, &key, &capsule)) {
+        if (!PyTuple_CheckExact(key) || PyTuple_GET_SIZE(key) != 3) {
+            continue;
+        }
+        PyObject *left_key = PyTuple_GET_ITEM(key, 0);
+        PyObject *right_key = PyTuple_GET_ITEM(key, 1);
+        PyObject *oparg_key = PyTuple_GET_ITEM(key, 2);
+        long candidate_oparg = PyLong_AsLong(oparg_key);
+        void *candidate_left = PyLong_AsVoidPtr(left_key);
+        void *candidate_right = PyLong_AsVoidPtr(right_key);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            continue;
+        }
+        if (candidate_oparg != binary_oparg ||
+            (left_type != NULL && candidate_left != left_type) ||
+            (right_type != NULL && candidate_right != right_type)) {
+            continue;
+        }
+        PyJitExtProvider *provider = jit_provider_from_capsule(capsule);
+        if (provider == NULL) {
+            continue;
+        }
+        if (match != NULL && match != provider) {
+            return NULL;
+        }
+        match = provider;
+    }
+    return match;
+}
+
 PyAPI_FUNC(int)
 PyJit_RegisterUnaryProvider(PyTypeObject *operand_type, int unary_opcode,
                             PyJitExtProvider *provider)
@@ -1152,11 +1221,27 @@ PyJit_LookupCallableProvider(PyObject *callable)
     if (registry == NULL) {
         return NULL;
     }
+    PyObject *lookup = callable;
     if (!tstate->interp->jit_callable_provider_cache_overflow &&
-        jit_callable_provider_cache_find(tstate->interp, callable) < 0) {
-        return NULL;
+        jit_callable_provider_cache_find(tstate->interp, lookup) < 0) {
+        if (!PyCFunction_Check(callable)) {
+            return NULL;
+        }
+        lookup = PyCFunction_GET_SELF(callable);
+        if (lookup == NULL ||
+            jit_callable_provider_cache_find(tstate->interp, lookup) < 0) {
+            return NULL;
+        }
     }
-    PyObject *capsule = PyDict_GetItemWithError(registry, callable);
+    PyObject *capsule = PyDict_GetItemWithError(registry, lookup);
+    if (capsule == NULL && lookup == callable &&
+        PyCFunction_Check(callable)) {
+        PyErr_Clear();
+        lookup = PyCFunction_GET_SELF(callable);
+        if (lookup != NULL) {
+            capsule = PyDict_GetItemWithError(registry, lookup);
+        }
+    }
     if (capsule == NULL) {
         if (PyErr_Occurred()) {
             PyErr_Clear();
@@ -2679,10 +2764,12 @@ ext_plan_from_uop(const _PyUOpInstruction *instruction)
         opcode = instruction->opcode;
     }
     if (opcode == _EXT_BINARY_EXEC ||
+        opcode == _EXT_COMPARE_EXEC ||
         opcode == _EXT_FUSED_BINARY2_EXEC ||
         opcode == _EXT_FUSED_BINARY2_RIGHT_EXEC ||
         opcode == _EXT_REGION_EXEC ||
-        opcode == _EXT_CALL_EXEC) {
+        opcode == _EXT_CALL_EXEC ||
+        opcode == _EXT_METHOD_CALL_EXEC) {
         return (PyJitExtPlan *)(uintptr_t)instruction->operand0;
     }
     if (opcode == _UNARY_NEGATIVE && instruction->operand0 != 0) {
@@ -3006,7 +3093,43 @@ jit_ext_is_region_node_uop(_PyUOpInstruction *inst)
     PyJitExtPlan *plan = ext_plan_from_uop(inst);
     return plan != NULL &&
            (plan->kind == PYJIT_EXT_PLAN_BINARY ||
-            plan->kind == PYJIT_EXT_PLAN_UNARY);
+            plan->kind == PYJIT_EXT_PLAN_UNARY ||
+            plan->kind == PYJIT_EXT_PLAN_CALL);
+}
+
+static int
+jit_ext_region_plan_arity(const PyJitExtPlan *plan)
+{
+    if (plan == NULL) {
+        return -1;
+    }
+    if (plan->kind == PYJIT_EXT_PLAN_UNARY) {
+        return 1;
+    }
+    if (plan->kind == PYJIT_EXT_PLAN_BINARY) {
+        return 2;
+    }
+    if (plan->kind == PYJIT_EXT_PLAN_CALL &&
+        plan->region_input_count > 0 &&
+        plan->region_input_count <= PYJIT_EXT_REGION_MAX_NODE_INPUTS) {
+        return plan->region_input_count;
+    }
+    return -1;
+}
+
+static int
+jit_ext_region_cleanup_count(_PyUOpInstruction *inst,
+                             const PyJitExtPlan *plan)
+{
+    if (plan != NULL && plan->kind == PYJIT_EXT_PLAN_CALL) {
+        return jit_ext_is_base_uop(inst, _EXT_METHOD_CALL_EXEC) ?
+            inst->oparg + 1 : 0;
+    }
+    if (plan != NULL && plan->kind == PYJIT_EXT_PLAN_BINARY &&
+        jit_ext_is_base_uop(inst, _EXT_COMPARE_EXEC)) {
+        return 0;
+    }
+    return jit_ext_region_plan_arity(plan);
 }
 
 static int
@@ -3399,6 +3522,10 @@ jit_ext_try_binary2_region(PyJitExtPlan *first_plan,
             .input_count = 2,
             .output = 3,
             .bytecode_target = first_target,
+            .dialect_id = first_plan->provider->dialect_id,
+            .semantic_version = first_plan->semantic_version,
+            .domain = first_plan->op_domain,
+            .output_count = first_plan->output_count,
         },
         {
             .atomic_plan = second_plan,
@@ -3408,6 +3535,10 @@ jit_ext_try_binary2_region(PyJitExtPlan *first_plan,
             .input_count = 2,
             .output = 4,
             .bytecode_target = second_target,
+            .dialect_id = second_plan->provider->dialect_id,
+            .semantic_version = second_plan->semantic_version,
+            .domain = second_plan->op_domain,
+            .output_count = second_plan->output_count,
         },
     };
     nodes[1].inputs[0] = second_consumes_right ? 2 : 3;
@@ -3425,8 +3556,14 @@ jit_ext_try_binary2_region(PyJitExtPlan *first_plan,
         inputs[2].value_id = 2;
     }
     uint64_t graph_hash = 1469598103934665603ULL;
+    graph_hash = (graph_hash ^ first_plan->provider->dialect_id) *
+                 1099511628211ULL;
     graph_hash = (graph_hash ^ first_plan->op_id) * 1099511628211ULL;
+    graph_hash = (graph_hash ^ first_plan->semantic_version) *
+                 1099511628211ULL;
     graph_hash = (graph_hash ^ second_plan->op_id) * 1099511628211ULL;
+    graph_hash = (graph_hash ^ second_plan->semantic_version) *
+                 1099511628211ULL;
     graph_hash = (graph_hash ^ (uint64_t)second_consumes_right) *
                  1099511628211ULL;
     PyJitExtRegionRequest request = {
@@ -3441,6 +3578,7 @@ jit_ext_try_binary2_region(PyJitExtPlan *first_plan,
         .graph_hash = graph_hash,
         .flags = PYJIT_EXT_EFFECT_PURE |
                  PYJIT_EXT_EFFECT_NO_PYTHON_CALLBACK,
+        .ir_version = PYJIT_EXT_CORE_IR_VERSION,
     };
     _PyJit_RecordExtOptimizerEvent(
         PYJIT_EXT_TRACE_REGION, PYJIT_EXT_OPT_TRY_PLAN);
@@ -3466,6 +3604,9 @@ jit_ext_try_binary2_region(PyJitExtPlan *first_plan,
         site->region_node_count = 2;
         site->region_input_count = 3;
         site->region_graph_hash = graph_hash;
+        site->region_op_signature =
+            ((uint64_t)first_plan->op_id & 0xffu) |
+            (((uint64_t)second_plan->op_id & 0xffu) << 8);
     }
     _PyJit_RecordExtOptimizerEvent(
         PYJIT_EXT_TRACE_REGION, PYJIT_EXT_OPT_PLAN_SUCCESS);
@@ -3490,7 +3631,8 @@ jit_ext_try_dag_region_at(_PyUOpInstruction *buffer, int length, int first)
     exec_indices[0] = first;
     if (plans[0] == NULL || plans[0]->provider == NULL ||
         (plans[0]->kind != PYJIT_EXT_PLAN_BINARY &&
-         plans[0]->kind != PYJIT_EXT_PLAN_UNARY) ||
+         plans[0]->kind != PYJIT_EXT_PLAN_UNARY &&
+         plans[0]->kind != PYJIT_EXT_PLAN_CALL) ||
         (plans[0]->site != NULL && plans[0]->site->region_disabled)) {
         return 0;
     }
@@ -3515,6 +3657,9 @@ jit_ext_try_dag_region_at(_PyUOpInstruction *buffer, int length, int first)
             }
             else if (!jit_ext_is_base_uop(&buffer[i], _NOP) &&
                      !jit_ext_is_base_uop(&buffer[i], _CHECK_VALIDITY) &&
+                     !jit_ext_is_base_uop(&buffer[i], _TIER2_RESUME_CHECK) &&
+                     !jit_ext_is_base_uop(&buffer[i],
+                                          _CHECK_IS_NOT_PY_CALLABLE) &&
                      !jit_ext_is_base_uop(&buffer[i], _SET_IP) &&
                      !jit_ext_is_safe_fused_other_load(&buffer[i])) {
                 safe = 0;
@@ -3522,11 +3667,12 @@ jit_ext_try_dag_region_at(_PyUOpInstruction *buffer, int length, int first)
             }
         }
         PyJitExtPlan *next_plan = ext_plan_from_uop(&buffer[next]);
-        int previous_arity = plans[node_count - 1]->kind ==
-            PYJIT_EXT_PLAN_UNARY ? 1 : 2;
-        if (!safe || cleanup_count != previous_arity || next_plan == NULL ||
+        int previous_cleanup = jit_ext_region_cleanup_count(
+            &buffer[previous], plans[node_count - 1]);
+        if (!safe || cleanup_count != previous_cleanup || next_plan == NULL ||
             (next_plan->kind != PYJIT_EXT_PLAN_BINARY &&
-             next_plan->kind != PYJIT_EXT_PLAN_UNARY) ||
+             next_plan->kind != PYJIT_EXT_PLAN_UNARY &&
+             next_plan->kind != PYJIT_EXT_PLAN_CALL) ||
             next_plan->provider != provider) {
             break;
         }
@@ -3543,7 +3689,10 @@ retry_dag_region_prefix:
     ;
     int first_set_ip = first - 1;
     while (first_set_ip >= 0 &&
-           jit_ext_is_base_uop(&buffer[first_set_ip], _NOP)) {
+           (jit_ext_is_base_uop(&buffer[first_set_ip], _NOP) ||
+            jit_ext_is_base_uop(
+                &buffer[first_set_ip],
+                _GUARD_CALLABLE_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS))) {
         first_set_ip--;
     }
     if (first_set_ip < 0 ||
@@ -3560,12 +3709,18 @@ retry_dag_region_prefix:
                    [PYJIT_EXT_REGION_MAX_NODE_INPUTS] = {{0}};
     int node_arity[PYJIT_EXT_REGION_MAX_NODES] = {0};
     int node_output[PYJIT_EXT_REGION_MAX_NODES] = {0};
+    int physical_inputs[PYJIT_EXT_REGION_MAX_NODES]
+                       [PYJIT_EXT_REGION_MAX_INPUTS] = {{0}};
+    int physical_input_count[PYJIT_EXT_REGION_MAX_NODES] = {0};
     int load_values[PYJIT_EXT_REGION_MAX_INPUTS] = {0};
     int load_count = 0;
     int current_node = 0;
-    int last_arity = plans[node_count - 1]->kind ==
-        PYJIT_EXT_PLAN_UNARY ? 1 : 2;
-    int last = exec_indices[node_count - 1] + last_arity;
+    int last_cleanup = jit_ext_region_cleanup_count(
+        &buffer[exec_indices[node_count - 1]], plans[node_count - 1]);
+    if (last_cleanup < 0) {
+        return 0;
+    }
+    int last = exec_indices[node_count - 1] + last_cleanup;
     for (int i = 0; i <= last; i++) {
         uint16_t opcode = _PyUop_Uncached[buffer[i].opcode];
         if (opcode == 0) {
@@ -3580,20 +3735,36 @@ retry_dag_region_prefix:
         }
         int is_node = current_node < node_count &&
                       i == exec_indices[current_node];
+        int is_method_node = is_node &&
+            jit_ext_is_base_uop(&buffer[i], _EXT_METHOD_CALL_EXEC);
         if (i == first) {
             depth_at_first = depth;
             memcpy(stack_at_first, stack, sizeof(int) * (size_t)depth);
         }
         if (is_node) {
-            int arity = plans[current_node]->kind ==
-                PYJIT_EXT_PLAN_UNARY ? 1 : 2;
-            if (popped < arity || depth < arity) {
+            int arity = jit_ext_region_plan_arity(plans[current_node]);
+            int physical_popped = is_method_node ? buffer[i].oparg + 2 : popped;
+            if (arity < 0 || physical_popped < arity || depth < arity ||
+                depth < physical_popped ||
+                physical_popped > PYJIT_EXT_REGION_MAX_INPUTS) {
                 return 0;
             }
             node_arity[current_node] = arity;
+            physical_input_count[current_node] = physical_popped;
+            for (int operand = 0; operand < physical_popped; operand++) {
+                physical_inputs[current_node][operand] =
+                    stack[depth - physical_popped + operand];
+            }
             for (int operand = 0; operand < arity; operand++) {
                 node_inputs[current_node][operand] =
                     stack[depth - arity + operand];
+            }
+            if (is_method_node) {
+                int value = next_value_id++;
+                node_output[current_node] = value;
+                stack[depth - physical_popped] = value;
+                current_node++;
+                continue;
             }
         }
         depth -= popped;
@@ -3607,8 +3778,7 @@ retry_dag_region_prefix:
                 if (load_count >= PYJIT_EXT_REGION_MAX_INPUTS) {
                     return 0;
                 }
-                load_values[load_count] = value;
-                load_count++;
+                load_values[load_count++] = value;
             }
             stack[depth++] = value;
         }
@@ -3678,6 +3848,23 @@ retry_dag_region_prefix:
             }
         }
     }
+    /* Call uops also consume callable/receiver scaffolding that is absent
+       from their semantic Core IR operands.  Keep those values as explicit
+       control live-ins so replacing the whole call sequence preserves the
+       physical stack contract. */
+    for (int node = 0; node < node_count; node++) {
+        for (int operand = 0; operand < physical_input_count[node]; operand++) {
+            int value = physical_inputs[node][operand];
+            for (int slot = 0; slot < depth_at_first; slot++) {
+                if (stack_at_first[slot] == value) {
+                    needed_before[slot] = 1;
+                    if (slot < first_needed) {
+                        first_needed = slot;
+                    }
+                }
+            }
+        }
+    }
     if (first_needed == depth_at_first) {
         return 0;
     }
@@ -3701,6 +3888,10 @@ retry_dag_region_prefix:
             for (int operand = 0; operand < node_arity[node]; operand++) {
                 used |= node_inputs[node][operand] == load_values[i];
             }
+            for (int operand = 0;
+                 operand < physical_input_count[node]; operand++) {
+                used |= physical_inputs[node][operand] == load_values[i];
+            }
         }
         if (!used) {
             return 0;
@@ -3717,6 +3908,15 @@ retry_dag_region_prefix:
     memset(nodes, 0, sizeof(nodes));
     for (int i = 0; i < input_count; i++) {
         inputs[i].value_id = (PyJitExtValueId)i;
+        int semantic = 0;
+        for (int node = 0; node < node_count; node++) {
+            for (int operand = 0; operand < node_arity[node]; operand++) {
+                semantic |= node_inputs[node][operand] == runtime_ids[i];
+            }
+        }
+        if (!semantic) {
+            inputs[i].flags = PYJIT_EXT_REGION_INPUT_CONTROL;
+        }
     }
     for (int node = 0; node < node_count; node++) {
         for (int operand = 0; operand < node_arity[node]; operand++) {
@@ -3744,6 +3944,10 @@ retry_dag_region_prefix:
         nodes[node].effect_flags = plans[node]->effect_flags;
         nodes[node].input_count = (uint8_t)node_arity[node];
         nodes[node].output = (PyJitExtValueId)(input_count + node);
+        nodes[node].dialect_id = plans[node]->provider->dialect_id;
+        nodes[node].semantic_version = plans[node]->semantic_version;
+        nodes[node].domain = plans[node]->op_domain;
+        nodes[node].output_count = plans[node]->output_count;
         int set_ip = exec_indices[node] - 1;
         while (set_ip >= 0 &&
                jit_ext_is_base_uop(&buffer[set_ip], _NOP)) {
@@ -3765,7 +3969,13 @@ retry_dag_region_prefix:
     uint32_t region_effects = PYJIT_EXT_EFFECT_PURE |
                               PYJIT_EXT_EFFECT_NO_PYTHON_CALLBACK;
     for (int node = 0; node < node_count; node++) {
+        graph_hash = (graph_hash ^ nodes[node].dialect_id) *
+                     1099511628211ULL;
         graph_hash = (graph_hash ^ nodes[node].semantic_id) *
+                     1099511628211ULL;
+        graph_hash = (graph_hash ^ nodes[node].semantic_version) *
+                     1099511628211ULL;
+        graph_hash = (graph_hash ^ nodes[node].domain) *
                      1099511628211ULL;
         for (int operand = 0; operand < nodes[node].input_count; operand++) {
             graph_hash = (graph_hash ^ nodes[node].inputs[operand]) *
@@ -3792,6 +4002,7 @@ retry_dag_region_prefix:
         .last_target = nodes[node_count - 1].bytecode_target,
         .graph_hash = graph_hash,
         .flags = region_effects,
+        .ir_version = PYJIT_EXT_CORE_IR_VERSION,
     };
     _PyJit_RecordExtOptimizerEvent(
         PYJIT_EXT_TRACE_REGION, PYJIT_EXT_OPT_VISIT);
@@ -3824,6 +4035,11 @@ retry_dag_region_prefix:
         site->region_node_count = (uint8_t)node_count;
         site->region_input_count = (uint8_t)input_count;
         site->region_graph_hash = graph_hash;
+        site->region_op_signature = 0;
+        for (int node = 0; node < node_count; node++) {
+            site->region_op_signature |=
+                ((uint64_t)nodes[node].semantic_id & 0xffu) << (node * 8);
+        }
     }
 
     _PyUOpInstruction original_set_ip = buffer[first_set_ip];
@@ -3966,12 +4182,21 @@ jit_ext_try_linear_region_at(_PyUOpInstruction *buffer, int length, int first)
         nodes[i].input_count = 2;
         nodes[i].output =
             (PyJitExtValueId)(PYJIT_EXT_REGION_MAX_INPUTS + i);
+        nodes[i].dialect_id = plans[i]->provider->dialect_id;
+        nodes[i].semantic_version = plans[i]->semantic_version;
+        nodes[i].domain = plans[i]->op_domain;
+        nodes[i].output_count = plans[i]->output_count;
         nodes[i].bytecode_target = i == 0 ? buffer[first_set_ip].target :
                                             buffer[set_ip_indices[i]].target;
     }
     uint64_t graph_hash = 1469598103934665603ULL;
     for (int i = 0; i < node_count; i++) {
+        graph_hash = (graph_hash ^ nodes[i].dialect_id) *
+                     1099511628211ULL;
         graph_hash = (graph_hash ^ plans[i]->op_id) * 1099511628211ULL;
+        graph_hash = (graph_hash ^ nodes[i].semantic_version) *
+                     1099511628211ULL;
+        graph_hash = (graph_hash ^ nodes[i].domain) * 1099511628211ULL;
     }
     PyJitExtRegionRequest request = {
         .provider = provider,
@@ -3985,6 +4210,7 @@ jit_ext_try_linear_region_at(_PyUOpInstruction *buffer, int length, int first)
         .graph_hash = graph_hash,
         .flags = PYJIT_EXT_EFFECT_PURE |
                  PYJIT_EXT_EFFECT_NO_PYTHON_CALLBACK,
+        .ir_version = PYJIT_EXT_CORE_IR_VERSION,
     };
     _PyJit_RecordExtOptimizerEvent(
         PYJIT_EXT_TRACE_REGION, PYJIT_EXT_OPT_VISIT);
@@ -4011,6 +4237,11 @@ jit_ext_try_linear_region_at(_PyUOpInstruction *buffer, int length, int first)
         site->region_node_count = (uint8_t)node_count;
         site->region_input_count = (uint8_t)input_count;
         site->region_graph_hash = graph_hash;
+        site->region_op_signature = 0;
+        for (int node = 0; node < node_count; node++) {
+            site->region_op_signature |=
+                ((uint64_t)nodes[node].semantic_id & 0xffu) << (node * 8);
+        }
     }
     _PyJit_RecordExtOptimizerEvent(
         PYJIT_EXT_TRACE_REGION, PYJIT_EXT_OPT_PLAN_SUCCESS);
@@ -4274,9 +4505,20 @@ jit_ext_restore_unconsumed_region_anchors(
             continue;
         }
         int binary_oparg = (int)plan->op_id;
-        if (plan->kind == PYJIT_EXT_PLAN_BINARY) {
+        if (plan->kind == PYJIT_EXT_PLAN_BINARY &&
+            jit_ext_is_base_uop(&buffer[i], _EXT_COMPARE_EXEC)) {
+            buffer[i].opcode = _COMPARE_OP;
+            buffer[i].oparg = binary_oparg;
+        }
+        else if (plan->kind == PYJIT_EXT_PLAN_BINARY) {
             buffer[i].opcode = _BINARY_OP;
             buffer[i].oparg = binary_oparg;
+        }
+        else if (plan->kind == PYJIT_EXT_PLAN_CALL &&
+                 (jit_ext_is_base_uop(&buffer[i], _EXT_CALL_EXEC) ||
+                  jit_ext_is_base_uop(
+                      &buffer[i], _EXT_METHOD_CALL_EXEC))) {
+            buffer[i].opcode = _CALL_NON_PY_GENERAL;
         }
         buffer[i].operand0 = 0;
         if (plan->provider != NULL && plan->provider->free_plan != NULL) {
@@ -4856,6 +5098,26 @@ uop_optimize(
         return -1;
     }
     jit_ext_restore_unconsumed_region_anchors(buffer, length);
+    _Py_CODEUNIT *trace_start =
+        _tstate->jit_tracer_state->initial_state.start_instr;
+    if (trace_start != NULL && trace_start->op.code == RESUME_CHECK_JIT) {
+        int entry_profitable = 0;
+        for (int i = 0; i < length; i++) {
+            PyJitExtPlan *plan = ext_plan_from_uop(&buffer[i]);
+            if (plan != NULL &&
+                (plan->flags & PYJIT_EXT_PLAN_ENTRY_PROFITABLE)) {
+                entry_profitable = 1;
+                break;
+            }
+        }
+        if (!entry_profitable) {
+            /* Entry probing is intentionally cheap and conservative.  Free
+               any provider plans created while analyzing the rejected trace;
+               loop/backedge policy remains unchanged. */
+            free_ext_plans_from_uops(buffer, length);
+            return 0;
+        }
+    }
     _PyUOpInstruction *output = &_tstate->jit_tracer_state->uop_array[0];
     length = stack_allocate(buffer, output, length);
     buffer = output;
@@ -5064,7 +5326,9 @@ _PyJit_RecordExtHit(PyJitExtPlan *plan)
         return;
     }
     PyJitExtSiteState *site = plan->site;
-    if (site->hit_count != UINT16_MAX) {
+    if (site->hit_count != UINT16_MAX &&
+        (plan->kind != PYJIT_EXT_PLAN_REGION || site->hit_count == 0 ||
+         jit_ext_stats_enabled())) {
         site->hit_count++;
     }
     if (plan->kind == PYJIT_EXT_PLAN_FUSED_BINARY2 &&
@@ -5098,7 +5362,20 @@ _Py_Executor_RecordExtMiss(_PyExecutorObject *executor, PyJitExtPlan *plan)
         }
         site->last_plan_op_id = plan->op_id;
         site->last_provider = plan->provider;
-        int miss_threshold = plan->kind == PYJIT_EXT_PLAN_REGION ?
+        int entry_probe_helper = 0;
+        if (plan->kind == PYJIT_EXT_PLAN_BINARY && executor != NULL) {
+            for (Py_ssize_t i = 0; i < executor->ext_plan_count; i++) {
+                PyJitExtPlan *candidate = executor->ext_plans[i];
+                if (candidate != NULL && candidate != plan &&
+                    (candidate->flags &
+                     PYJIT_EXT_PLAN_ENTRY_PROFITABLE) != 0) {
+                    entry_probe_helper = 1;
+                    break;
+                }
+            }
+        }
+        int miss_threshold = entry_probe_helper ? 1 :
+            plan->kind == PYJIT_EXT_PLAN_REGION ?
             jit_ext_env_int("PYTHON_JIT_EXT_REGION_DISABLE_MISSES", 2) :
             site->trace_kind == PYJIT_EXT_TRACE_BINARY ?
             jit_ext_env_int("PYTHON_JIT_EXT_BINARY_DISABLE_MISSES", 8) :

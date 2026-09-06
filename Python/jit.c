@@ -649,10 +649,12 @@ jit_ext_is_external_uop(uint16_t opcode)
         base_opcode = opcode;
     }
     return base_opcode == _EXT_BINARY_EXEC ||
+           base_opcode == _EXT_COMPARE_EXEC ||
            base_opcode == _EXT_FUSED_BINARY2_EXEC ||
            base_opcode == _EXT_FUSED_BINARY2_RIGHT_EXEC ||
            base_opcode == _EXT_REGION_EXEC ||
-           base_opcode == _EXT_CALL_EXEC;
+           base_opcode == _EXT_CALL_EXEC ||
+           base_opcode == _EXT_METHOD_CALL_EXEC;
 }
 
 static PyJitExtPlan *

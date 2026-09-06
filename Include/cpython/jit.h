@@ -13,10 +13,11 @@ extern "C" {
  * plan payloads and run their own guards, allocation, and kernels from eval().
  */
 
-#define PYJIT_EXT_ABI_VERSION 5u
+#define PYJIT_EXT_ABI_VERSION 7u
+#define PYJIT_EXT_CORE_IR_VERSION 1u
 
-#define PYJIT_EXT_REGION_MAX_NODES 4
-#define PYJIT_EXT_REGION_MAX_INPUTS 6
+#define PYJIT_EXT_REGION_MAX_NODES 6
+#define PYJIT_EXT_REGION_MAX_INPUTS 8
 #define PYJIT_EXT_REGION_MAX_NODE_INPUTS 3
 #define PYJIT_EXT_REGION_PIC_SIZE 4
 #define PYJIT_EXT_UNARY_NEGATIVE 1
@@ -42,12 +43,28 @@ typedef struct _PyJitExtSiteState PyJitExtSiteState;
 typedef struct _PyJitExtLoweredRegion PyJitExtLoweredRegion;
 
 typedef uint16_t PyJitExtValueId;
+typedef uint64_t PyJitExtDialectId;
+
+typedef enum {
+    PYJIT_EXT_OP_DOMAIN_OPAQUE = 0,
+    PYJIT_EXT_OP_DOMAIN_ELEMENTWISE = 1,
+    PYJIT_EXT_OP_DOMAIN_REDUCTION = 2,
+    PYJIT_EXT_OP_DOMAIN_CONTRACTION = 3,
+    PYJIT_EXT_OP_DOMAIN_VIEW = 4,
+} PyJitExtOpDomain;
 
 typedef struct {
     PyJitExtValueId value_id;
     PyTypeObject *type;
     uint32_t flags;
 } PyJitExtRegionInput;
+
+/* The value is present only to preserve the physical call-stack contract; it
+   is not a semantic operand of any Core IR node.  Providers may ignore it. */
+#define PYJIT_EXT_REGION_INPUT_CONTROL (1u << 0)
+
+/* Binary registry opcode namespace reserved for rich comparisons. */
+#define PYJIT_EXT_BINARY_RICHCOMPARE_BASE 0x100
 
 typedef struct {
     const PyJitExtPlan *atomic_plan;
@@ -57,6 +74,14 @@ typedef struct {
     uint8_t input_count;
     PyJitExtValueId output;
     uint32_t bytecode_target;
+    /* Stable, language-neutral operation identity.  semantic_id is scoped by
+       dialect_id; semantic_version versions that dialect's operation schema. */
+    PyJitExtDialectId dialect_id;
+    uint16_t semantic_version;
+    uint8_t domain;
+    uint8_t output_count;
+    const void *attributes;
+    uint32_t attributes_size;
 } PyJitExtRegionNode;
 
 typedef struct {
@@ -70,6 +95,9 @@ typedef struct {
     uint32_t last_target;
     uint64_t graph_hash;
     uint32_t flags;
+    uint16_t ir_version;
+    uint16_t reserved;
+    uint32_t required_features;
 } PyJitExtRegionRequest;
 
 typedef PyJitExtResult (*PyJitExtRegionEvalFunc)(
@@ -102,6 +130,7 @@ typedef struct {
         } unary;
         struct {
             PyObject *callable;
+            PyObject *receiver;
             Py_ssize_t nargs;
             uint32_t call_flags;
             PyObject *kwnames;
@@ -161,6 +190,10 @@ struct _PyJitExtProvider {
         Py_ssize_t nargs,
         uint64_t signature);
     void (*free_lowered_region)(PyJitExtLoweredRegion *lowered);
+    PyJitExtDialectId dialect_id;
+    uint16_t dialect_version;
+    uint16_t core_ir_version;
+    uint32_t core_ir_features;
 };
 
 typedef enum {
@@ -185,6 +218,7 @@ typedef PyJitExtResult (*PyJitExtBinaryEvalFunc)(
 typedef PyJitExtResult (*PyJitExtCallEvalFunc)(
     void *payload,
     PyObject *callable,
+    PyObject *receiver,
     PyObject *const *args,
     Py_ssize_t nargs,
     PyObject **result);
@@ -277,6 +311,9 @@ struct _PyJitExtPlan {
     uint32_t effect_flags;
     int8_t mutation_input;
     uint8_t region_input_count;
+    uint8_t op_domain;
+    uint8_t output_count;
+    uint16_t semantic_version;
 };
 
 #define PYJIT_EXT_PLAN_REQUIRES_GIL          (1u << 0)
@@ -287,6 +324,7 @@ struct _PyJitExtPlan {
 #define PYJIT_EXT_PLAN_NEEDS_SYNC_ON_DEOPT   (1u << 5)
 #define PYJIT_EXT_PLAN_OPAQUE_EFFECTS        (1u << 6)
 #define PYJIT_EXT_PLAN_REGION_ANCHOR_ONLY    (1u << 7)
+#define PYJIT_EXT_PLAN_ENTRY_PROFITABLE      (1u << 8)
 
 #define PYJIT_EXT_EFFECT_PURE                (1u << 0)
 #define PYJIT_EXT_EFFECT_NO_PYTHON_CALLBACK  (1u << 1)
@@ -369,6 +407,7 @@ struct _PyJitExtSiteState {
     uint8_t region_node_count;
     uint8_t region_input_count;
     uint64_t region_graph_hash;
+    uint64_t region_op_signature;
     uint8_t region_disabled;
     const char *region_disable_reason;
     uint16_t region_pic_hit_count;
@@ -379,6 +418,10 @@ struct _PyJitExtSiteState {
     uint16_t region_saturated_count;
     const char *region_lowering_name;
     const char *region_guard_fail_reason;
+    /* Provider-owned cache whose lifetime follows the bytecode site rather
+       than any one speculative executor/plan generation. */
+    void *provider_data;
+    void (*free_provider_data)(void *provider_data);
 };
 
 #define PYJIT_CALL_HAS_KWARGS        (1u << 0)

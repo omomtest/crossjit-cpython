@@ -223,6 +223,8 @@ int _PyJitExtPlanNoEmit(void);
 bool _PyJit_MaybeHasBinaryProviderForOparg(int binary_oparg);
 bool _PyJit_MaybeHasBinaryProviderForTypesOparg(
     PyTypeObject *left_type, PyTypeObject *right_type, int binary_oparg);
+PyJitExtProvider *_PyJit_LookupBinaryProviderForKnownTypes(
+    PyTypeObject *left_type, PyTypeObject *right_type, int binary_oparg);
 bool _PyJit_MaybeHasCallableProvider(PyObject *callable);
 void _PyJit_RecordExtOptimizerEvent(PyJitExtTraceKind kind,
                                     PyJitExtOptimizerEvent event);

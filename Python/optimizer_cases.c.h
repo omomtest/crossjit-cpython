@@ -970,6 +970,16 @@
             break;
         }
 
+        case _EXT_COMPARE_EXEC: {
+            JitOptRef res;
+            res = sym_new_not_null(ctx);
+            CHECK_STACK_BOUNDS(-1);
+            stack_pointer[-2] = res;
+            stack_pointer += -1;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
         case _EXT_FUSED_BINARY2_EXEC: {
             JitOptRef res;
             JitOptRef l;
@@ -1025,6 +1035,10 @@
             stack_pointer[-2 - oparg] = res;
             stack_pointer += -1 - oparg;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
+        case _EXT_METHOD_CALL_EXEC: {
             break;
         }
 
@@ -2698,10 +2712,26 @@
             JitOptRef *self_or_null;
             owner = stack_pointer[-1];
             self_or_null = &stack_pointer[0];
-            (void)owner;
             attr = sym_new_not_null(ctx);
             if (oparg & 1) {
                 self_or_null[0] = sym_new_unknown(ctx);
+                PyObject *owner_o = sym_get_probable_value(owner);
+                if (owner_o != NULL &&
+                    _PyJit_MaybeHasCallableProvider(owner_o)) {
+                    CHECK_STACK_BOUNDS((oparg&1));
+                    stack_pointer[-1] = attr;
+                    stack_pointer += (oparg&1);
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    PyObject *name = get_co_name(ctx, oparg >> 1);
+                    PyObject *descr = _PyType_LookupRef(Py_TYPE(owner_o), name);
+                    if (descr != NULL &&
+                        Py_IS_TYPE(descr, &PyMethodDescr_Type)) {
+                        sym_set_recorded_value(attr, descr);
+                        sym_set_recorded_value(self_or_null[0], owner_o);
+                    }
+                    Py_XDECREF(descr);
+                    stack_pointer += -(oparg&1);
+                }
             }
             CHECK_STACK_BOUNDS((oparg&1));
             stack_pointer[-1] = attr;
@@ -3015,56 +3045,121 @@
             JitOptRef res;
             right = stack_pointer[-1];
             left = stack_pointer[-2];
-            if (
-                sym_is_safe_const(ctx, left) &&
-                sym_is_safe_const(ctx, right)
-            ) {
-                JitOptRef left_sym = left;
-                JitOptRef right_sym = right;
-                _PyStackRef left = sym_get_const_as_stackref(ctx, left_sym);
-                _PyStackRef right = sym_get_const_as_stackref(ctx, right_sym);
-                _PyStackRef res_stackref;
-                /* Start of uop copied from bytecodes for constant evaluation */
-                PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
-                PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
-                assert((oparg >> 5) <= Py_GE);
-                PyObject *res_o = PyObject_RichCompare(left_o, right_o, oparg >> 5);
-                if (res_o == NULL) {
-                    goto error;
-                }
-                if (oparg & 16) {
-                    int res_bool = PyObject_IsTrue(res_o);
-                    Py_DECREF(res_o);
-                    if (res_bool < 0) {
-                        goto error;
-                    }
-                    res_stackref = res_bool ? PyStackRef_True : PyStackRef_False;
-                }
-                else {
-                    res_stackref = PyStackRef_FromPyObjectSteal(res_o);
-                }
-                /* End of uop copied from bytecodes for constant evaluation */
-                res = sym_new_const_steal(ctx, PyStackRef_AsPyObjectSteal(res_stackref));
-                if (sym_is_const(ctx, res)) {
-                    PyObject *result = sym_get_const(ctx, res);
-                    if (_Py_IsImmortal(result)) {
-                        // Replace with _POP_TOP + _POP_TOP + _LOAD_CONST_INLINE_BORROW since we have two inputs and an immortal result
-                        ADD_OP(_POP_TOP, 0, 0);
-                        ADD_OP(_POP_TOP, 0, 0);
-                        ADD_OP(_LOAD_CONST_INLINE_BORROW, 0, (uintptr_t)result);
-                    }
-                }
+            res = sym_new_not_null(ctx);
+            bool handled = false;
+            int richcompare_op = oparg >> 5;
+            int registry_oparg = PYJIT_EXT_BINARY_RICHCOMPARE_BASE + richcompare_op;
+            PyTypeObject *left_type = sym_get_type(left);
+            if (left_type == NULL) {
+                left_type = sym_get_probable_type(left);
+            }
+            PyTypeObject *right_type = sym_get_type(right);
+            if (right_type == NULL) {
+                right_type = sym_get_probable_type(right);
+            }
+            if (!(oparg & 16) && _PyJitExtEnableBinary() &&
+                (left_type != NULL || right_type != NULL)) {
                 CHECK_STACK_BOUNDS(-1);
                 stack_pointer[-2] = res;
                 stack_pointer += -1;
                 ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-                break;
+                PyJitExtProvider *provider =
+                _PyJit_LookupBinaryProviderForKnownTypes(
+                    left_type, right_type, registry_oparg);
+                if (provider != NULL && !_PyJitExtLookupOnly()) {
+                    PyJitExtTraceRequest request = {
+                        .kind = PYJIT_EXT_TRACE_BINARY,
+                        .u.binary = {
+                            .binary_oparg = registry_oparg,
+                            .left_type = left_type,
+                            .right_type = right_type,
+                        },
+                    };
+                    PyCodeObject *code = get_current_code_object(ctx);
+                    PyJitExtSiteState *site = _PyJit_GetExtSiteState(
+                        code, this_instr->target, &request, 1);
+                    if (site == NULL && PyErr_Occurred()) {
+                        ctx->done = true;
+                        break;
+                    }
+                    PyJitExtPlan *plan = provider->try_plan(&request, site);
+                    if (plan != NULL) {
+                        plan->site = site;
+                        if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                            if (plan->provider != NULL &&
+                                plan->provider->free_plan != NULL) {
+                                plan->provider->free_plan(plan);
+                            }
+                            ctx->done = true;
+                            break;
+                        }
+                        ADD_OP(_EXT_COMPARE_EXEC, oparg, (uintptr_t)plan);
+                        handled = true;
+                    }
+                    else if (PyErr_Occurred()) {
+                        ctx->done = true;
+                        break;
+                    }
+                }
+                stack_pointer += 1;
             }
-            if (oparg & 16) {
-                res = sym_new_type(ctx, &PyBool_Type);
-            }
-            else {
-                res = _Py_uop_sym_new_not_null(ctx);
+            if (!handled) {
+                if (
+                    sym_is_safe_const(ctx, left) &&
+                    sym_is_safe_const(ctx, right)
+                ) {
+                    JitOptRef left_sym = left;
+                    JitOptRef right_sym = right;
+                    _PyStackRef left = sym_get_const_as_stackref(ctx, left_sym);
+                    _PyStackRef right = sym_get_const_as_stackref(ctx, right_sym);
+                    _PyStackRef res_stackref;
+                    /* Start of uop copied from bytecodes for constant evaluation */
+                    PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
+                    PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
+                    assert((oparg >> 5) <= Py_GE);
+                    PyObject *res_o = PyObject_RichCompare(left_o, right_o, oparg >> 5);
+                    if (res_o == NULL) {
+                        goto error;
+                    }
+                    if (oparg & 16) {
+                        int res_bool = PyObject_IsTrue(res_o);
+                        Py_DECREF(res_o);
+                        if (res_bool < 0) {
+                            goto error;
+                        }
+                        res_stackref = res_bool ? PyStackRef_True : PyStackRef_False;
+                    }
+                    else {
+                        res_stackref = PyStackRef_FromPyObjectSteal(res_o);
+                    }
+                    /* End of uop copied from bytecodes for constant evaluation */
+                    res = sym_new_const_steal(ctx, PyStackRef_AsPyObjectSteal(res_stackref));
+                    if (sym_is_const(ctx, res)) {
+                        PyObject *result = sym_get_const(ctx, res);
+                        if (_Py_IsImmortal(result)) {
+                            // Replace with _POP_TOP + _POP_TOP + _LOAD_CONST_INLINE_BORROW since we have two inputs and an immortal result
+                            ADD_OP(_POP_TOP, 0, 0);
+                            ADD_OP(_POP_TOP, 0, 0);
+                            ADD_OP(_LOAD_CONST_INLINE_BORROW, 0, (uintptr_t)result);
+                        }
+                    }
+                    CHECK_STACK_BOUNDS(-1);
+                    stack_pointer[-2] = res;
+                    stack_pointer += -1;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    break;
+                }
+                if (oparg & 16) {
+                    res = sym_new_type(ctx, &PyBool_Type);
+                }
+                else {
+                    CHECK_STACK_BOUNDS(-1);
+                    stack_pointer[-2] = res;
+                    stack_pointer += -1;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    res = _Py_uop_sym_new_not_null(ctx);
+                    stack_pointer += 1;
+                }
             }
             CHECK_STACK_BOUNDS(-1);
             stack_pointer[-2] = res;
@@ -4264,19 +4359,32 @@
             callable = stack_pointer[-2 - oparg];
             _PyJit_RecordExtOptimizerEvent(
                                        PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_VISIT);
-            if (!_PyJitExtEnableCall() ||
-                !sym_is_null(self_or_null)) {
+            if (!_PyJitExtEnableCall()) {
                 _PyJit_RecordExtOptimizerEvent(
                     PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_SUPPORTED_OP_SKIP);
             }
             else {
                 PyObject *callable_o = sym_get_const(ctx, callable);
+                if (callable_o == NULL) {
+                    callable_o = sym_get_probable_value(callable);
+                }
+                PyObject *receiver_o = sym_is_null(self_or_null) ? NULL :
+                sym_get_const(ctx, self_or_null);
+                if (receiver_o == NULL && !sym_is_null(self_or_null)) {
+                    receiver_o = sym_get_probable_value(self_or_null);
+                }
                 if (callable_o != NULL) {
                     PyJitExtProvider *provider = NULL;
                     if (_PyJit_MaybeHasCallableProvider(callable_o)) {
                         _PyJit_RecordExtOptimizerEvent(
                             PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
                         provider = PyJit_LookupCallableProvider(callable_o);
+                    }
+                    else if (receiver_o != NULL &&
+                         _PyJit_MaybeHasCallableProvider(receiver_o)) {
+                        _PyJit_RecordExtOptimizerEvent(
+                            PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
+                        provider = PyJit_LookupCallableProvider(receiver_o);
                     }
                     else {
                         _PyJit_RecordExtOptimizerEvent(
@@ -4288,6 +4396,7 @@
                             .kind = PYJIT_EXT_TRACE_CALL,
                             .u.call = {
                                 .callable = callable_o,
+                                .receiver = receiver_o,
                                 .nargs = oparg,
                                 .call_flags = 0,
                                 .kwnames = NULL,
@@ -4685,6 +4794,9 @@
             JitOptRef callable;
             callable = stack_pointer[-2 - oparg];
             PyObject *callable_o = sym_get_const(ctx, callable);
+            if (callable_o == NULL) {
+                callable_o = sym_get_probable_value(callable);
+            }
             if (callable_o && sym_matches_type(callable, &PyType_Type)) {
                 PyTypeObject *tp = (PyTypeObject *)callable_o;
                 if (tp->tp_vectorcall != NULL) {
@@ -4797,10 +4909,74 @@
         }
 
         case _CALL_BUILTIN_FAST_WITH_KEYWORDS: {
+            JitOptRef self_or_null;
             JitOptRef callable;
+            self_or_null = stack_pointer[-1 - oparg];
             callable = stack_pointer[-2 - oparg];
-            callable = sym_new_not_null(ctx);
-            stack_pointer[-2 - oparg] = callable;
+            _PyJit_RecordExtOptimizerEvent(
+                                       PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_VISIT);
+            PyObject *callable_o = sym_get_const(ctx, callable);
+            if (callable_o == NULL) {
+                callable_o = sym_get_probable_value(callable);
+            }
+            int external_handled = 0;
+            if (callable_o != NULL && _PyJitExtEnableCall() &&
+                _PyJit_MaybeHasCallableProvider(callable_o)) {
+                _PyJit_RecordExtOptimizerEvent(
+                    PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
+                PyJitExtProvider *provider = PyJit_LookupCallableProvider(callable_o);
+                if (provider != NULL && !_PyJitExtLookupOnly()) {
+                    PyObject *receiver_o = sym_is_null(self_or_null) ? NULL :
+                    sym_get_const(ctx, self_or_null);
+                    if (receiver_o == NULL && !sym_is_null(self_or_null)) {
+                        receiver_o = sym_get_probable_value(self_or_null);
+                    }
+                    PyJitExtTraceRequest request = {
+                        .kind = PYJIT_EXT_TRACE_CALL,
+                        .u.call = {
+                            .callable = callable_o,
+                            .receiver = receiver_o,
+                            .nargs = oparg,
+                            .call_flags = 0,
+                            .kwnames = NULL,
+                        },
+                    };
+                    PyCodeObject *code = get_current_code_object(ctx);
+                    PyJitExtSiteState *site = _PyJit_GetExtSiteState(
+                        code, this_instr->target, &request, 1);
+                    if (site == NULL && PyErr_Occurred()) {
+                        ctx->done = true;
+                        break;
+                    }
+                    PyJitExtPlan *plan = provider->try_plan(&request, site);
+                    _PyJit_RecordExtOptimizerEvent(
+                        PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_TRY_PLAN);
+                    if (plan != NULL) {
+                        _PyJit_RecordExtOptimizerEvent(
+                            PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PLAN_SUCCESS);
+                        plan->site = site;
+                        if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                            if (plan->provider != NULL &&
+                                plan->provider->free_plan != NULL) {
+                                plan->provider->free_plan(plan);
+                            }
+                            ctx->done = true;
+                            break;
+                        }
+                        ADD_OP(_EXT_METHOD_CALL_EXEC, oparg, (uintptr_t)plan);
+                        external_handled = 1;
+                    }
+                    else if (PyErr_Occurred()) {
+                        ctx->done = true;
+                        break;
+                    }
+                }
+            }
+            else {
+                _PyJit_RecordExtOptimizerEvent(
+                    PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PROVIDER_PREFILTER_MISS);
+            }
+            (void)external_handled;
             break;
         }
 
@@ -5089,15 +5265,94 @@
             JitOptRef callable;
             self_or_null = stack_pointer[-1 - oparg];
             callable = stack_pointer[-2 - oparg];
+            _PyJit_RecordExtOptimizerEvent(
+                                       PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_VISIT);
             PyObject *callable_o = sym_get_const(ctx, callable);
-            if (callable_o && Py_IS_TYPE(callable_o, &PyMethodDescr_Type)
-                && sym_is_not_null(self_or_null)) {
-                PyMethodDescrObject *method = (PyMethodDescrObject *)callable_o;
-                PyCFunction cfunc = method->d_method->ml_meth;
-                ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS_INLINE, oparg, (uintptr_t)cfunc);
+            if (callable_o == NULL) {
+                callable_o = sym_get_probable_value(callable);
             }
-            callable = sym_new_not_null(ctx);
-            stack_pointer[-2 - oparg] = callable;
+            PyObject *receiver_o = sym_get_const(ctx, self_or_null);
+            if (receiver_o == NULL) {
+                receiver_o = sym_get_probable_value(self_or_null);
+            }
+            PyTypeObject *receiver_type = sym_get_type(self_or_null);
+            if (receiver_type == NULL) {
+                receiver_type = sym_get_probable_type(self_or_null);
+            }
+            int external_handled = 0;
+            if (sym_is_not_null(self_or_null)) {
+                PyJitExtProvider *provider = NULL;
+                if (callable_o != NULL && _PyJitExtEnableCall() &&
+                    _PyJit_MaybeHasCallableProvider(callable_o)) {
+                    _PyJit_RecordExtOptimizerEvent(
+                        PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
+                    provider = PyJit_LookupCallableProvider(callable_o);
+                }
+                if (provider == NULL && receiver_o != NULL &&
+                    _PyJitExtEnableCall() &&
+                    _PyJit_MaybeHasCallableProvider(receiver_o)) {
+                    _PyJit_RecordExtOptimizerEvent(
+                        PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
+                    provider = PyJit_LookupCallableProvider(receiver_o);
+                }
+                if (provider == NULL && receiver_type != NULL &&
+                    _PyJitExtEnableCall() &&
+                    _PyJit_MaybeHasCallableProvider((PyObject *)receiver_type)) {
+                    _PyJit_RecordExtOptimizerEvent(
+                        PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
+                    provider = PyJit_LookupCallableProvider(
+                        (PyObject *)receiver_type);
+                }
+                if (provider != NULL && !_PyJitExtLookupOnly()) {
+                    PyJitExtTraceRequest request = {
+                        .kind = PYJIT_EXT_TRACE_CALL,
+                        .u.call = {
+                            .callable = callable_o,
+                            .receiver = receiver_o,
+                            .nargs = oparg,
+                            .call_flags = 0,
+                            .kwnames = NULL,
+                        },
+                    };
+                    PyCodeObject *code = get_current_code_object(ctx);
+                    PyJitExtSiteState *site = _PyJit_GetExtSiteState(
+                        code, this_instr->target, &request, 1);
+                    if (site == NULL && PyErr_Occurred()) {
+                        ctx->done = true;
+                        break;
+                    }
+                    _PyJit_RecordExtOptimizerEvent(
+                        PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_TRY_PLAN);
+                    PyJitExtPlan *plan = provider->try_plan(&request, site);
+                    if (plan != NULL) {
+                        _PyJit_RecordExtOptimizerEvent(
+                            PYJIT_EXT_TRACE_CALL, PYJIT_EXT_OPT_PLAN_SUCCESS);
+                        plan->site = site;
+                        if (_Py_uop_opt_own_ext_plan(ctx, plan) < 0) {
+                            if (plan->provider != NULL &&
+                                plan->provider->free_plan != NULL) {
+                                plan->provider->free_plan(plan);
+                            }
+                            ctx->done = true;
+                            break;
+                        }
+                        ADD_OP(_EXT_METHOD_CALL_EXEC, oparg, (uintptr_t)plan);
+                        external_handled = 1;
+                    }
+                    else if (PyErr_Occurred()) {
+                        ctx->done = true;
+                        break;
+                    }
+                }
+                if (!external_handled && callable_o != NULL &&
+                    Py_IS_TYPE(callable_o, &PyMethodDescr_Type)) {
+                    PyMethodDescrObject *method =
+                    (PyMethodDescrObject *)callable_o;
+                    PyCFunction cfunc = method->d_method->ml_meth;
+                    ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS_INLINE,
+                       oparg, (uintptr_t)cfunc);
+                }
+            }
             break;
         }
 
@@ -5525,37 +5780,21 @@
                     PYJIT_EXT_BINARY_ADMISSION_SUPPORTED_OP_SKIP);
             }
             else {
-                if (left_type == NULL) {
+                if (left_type == NULL && right_type == NULL) {
                     _PyJit_RecordExtBinaryAdmission(
                         oparg, left_type, right_type,
                         PYJIT_EXT_BINARY_ADMISSION_MISSING_LEFT_TYPE);
                 }
-                else if (right_type == NULL) {
-                    _PyJit_RecordExtBinaryAdmission(
-                        oparg, left_type, right_type,
-                        PYJIT_EXT_BINARY_ADMISSION_MISSING_RIGHT_TYPE);
-                }
                 else {
-                    PyJitExtProvider *provider = NULL;
-                    if (_PyJit_MaybeHasBinaryProviderForTypesOparg(
-                            left_type, right_type, oparg)) {
-                        _PyJit_RecordExtOptimizerEvent(
-                            PYJIT_EXT_TRACE_BINARY, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
-                        provider = PyJit_LookupBinaryProvider(
-                            left_type, right_type, oparg);
-                        if (provider == NULL) {
-                            _PyJit_RecordExtBinaryAdmission(
-                                oparg, left_type, right_type,
-                                PYJIT_EXT_BINARY_ADMISSION_PROVIDER_NOT_FOUND);
-                        }
-                    }
-                    else {
-                        _PyJit_RecordExtOptimizerEvent(
-                            PYJIT_EXT_TRACE_BINARY,
-                            PYJIT_EXT_OPT_PROVIDER_PREFILTER_MISS);
+                    _PyJit_RecordExtOptimizerEvent(
+                        PYJIT_EXT_TRACE_BINARY, PYJIT_EXT_OPT_PROVIDER_LOOKUP);
+                    PyJitExtProvider *provider =
+                    _PyJit_LookupBinaryProviderForKnownTypes(
+                        left_type, right_type, oparg);
+                    if (provider == NULL) {
                         _PyJit_RecordExtBinaryAdmission(
                             oparg, left_type, right_type,
-                            PYJIT_EXT_BINARY_ADMISSION_UNSUPPORTED_TYPE_PAIR);
+                            PYJIT_EXT_BINARY_ADMISSION_PROVIDER_NOT_FOUND);
                     }
                     if (provider != NULL && !_PyJitExtLookupOnly()) {
                         PyJitExtTraceRequest request = {

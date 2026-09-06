@@ -801,6 +801,31 @@ dummy_func(
             INPUTS_DEAD();
         }
 
+        /* Rich comparisons consume their operands directly, unlike the
+           BINARY_OP family whose cleanup uops retain operand stackrefs. */
+        op(_EXT_COMPARE_EXEC, (plan_index/1, left, right -- res)) {
+            EXIT_IF(plan_index >= current_executor->ext_plan_count);
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_BINARY ||
+                    plan->eval.binary_eval == NULL);
+            PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
+            PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
+            PyObject *res_o = NULL;
+            PyJitExtResult jit_res = plan->eval.binary_eval(
+                plan->payload, left_o, right_o, &res_o);
+            if (jit_res == PYJIT_EXT_MISS) {
+                _Py_Executor_RecordExtMiss(current_executor, plan);
+                EXIT_IF(true);
+            }
+            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
+                ERROR_NO_POP();
+            }
+            _PyJit_RecordExtHit(plan);
+            DECREF_INPUTS();
+            INPUTS_DEAD();
+            res = PyStackRef_FromPyObjectSteal(res_o);
+        }
+
         op(_EXT_FUSED_BINARY2_EXEC, (plan_index/1, first_left, first_right, second_other -- res, l, r, o)) {
             EXIT_IF(plan_index >= current_executor->ext_plan_count);
             PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
@@ -916,9 +941,9 @@ dummy_func(
             PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
             EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_CALL ||
                     plan->eval.call_eval == NULL);
-            EXIT_IF(!PyStackRef_IsNull(self_or_null));
-
             PyObject *callable_o = PyStackRef_AsPyObjectBorrow(callable);
+            PyObject *receiver_o = PyStackRef_IsNull(self_or_null) ? NULL :
+                PyStackRef_AsPyObjectBorrow(self_or_null);
             PyObject *args_o[16];
             PyObject **args_heap = NULL;
             PyObject **args_ptr = args_o;
@@ -937,7 +962,8 @@ dummy_func(
 
             PyObject *res_o = NULL;
             PyJitExtResult jit_res = plan->eval.call_eval(
-                plan->payload, callable_o, (PyObject *const *)args_ptr,
+                plan->payload, callable_o, receiver_o,
+                (PyObject *const *)args_ptr,
                 oparg, &res_o);
             PyMem_Free(args_heap);
             if (jit_res == PYJIT_EXT_MISS) {
@@ -951,6 +977,54 @@ dummy_func(
 
             INPUTS_DEAD();
             res = PyStackRef_FromPyObjectSteal(res_o);
+        }
+
+        /* Method-descriptor calls keep receiver and argument stackrefs alive
+           until the CALL family's existing cleanup uops run.  This variant
+           therefore replaces only the callable slot with the result, matching
+           _CALL_METHOD_DESCRIPTOR_*_INLINE exactly while allowing a provider
+           to expose the method as a Core IR node. */
+        op(_EXT_METHOD_CALL_EXEC,
+           (plan_index/1, callable, self_or_null, args[oparg] --
+            callable, self_or_null, args[oparg])) {
+            EXIT_IF(plan_index >= current_executor->ext_plan_count);
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_CALL ||
+                    plan->eval.call_eval == NULL);
+            PyObject *callable_o = PyStackRef_AsPyObjectBorrow(callable);
+            PyObject *receiver_o = PyStackRef_IsNull(self_or_null) ? NULL :
+                PyStackRef_AsPyObjectBorrow(self_or_null);
+            PyObject *args_o[16];
+            PyObject **args_heap = NULL;
+            PyObject **args_ptr = args_o;
+            if (oparg > 16) {
+                args_heap = (PyObject **)PyMem_Malloc(
+                    oparg * sizeof(PyObject *));
+                if (args_heap == NULL) {
+                    PyErr_NoMemory();
+                    ERROR_NO_POP();
+                }
+                args_ptr = args_heap;
+            }
+            for (int i = 0; i < oparg; i++) {
+                args_ptr[i] = PyStackRef_AsPyObjectBorrow(args[i]);
+            }
+            PyObject *res_o = NULL;
+            PyJitExtResult jit_res = plan->eval.call_eval(
+                plan->payload, callable_o, receiver_o,
+                (PyObject *const *)args_ptr, oparg, &res_o);
+            PyMem_Free(args_heap);
+            if (jit_res == PYJIT_EXT_MISS) {
+                _Py_Executor_RecordExtMiss(current_executor, plan);
+                EXIT_IF(true);
+            }
+            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
+                ERROR_NO_POP();
+            }
+            _PyJit_RecordExtHit(plan);
+            _PyStackRef old_callable = callable;
+            callable = PyStackRef_FromPyObjectSteal(res_o);
+            PyStackRef_CLOSE(old_callable);
         }
 
         pure op(_BINARY_OP_MULTIPLY_FLOAT, (left, right -- res, l, r)) {

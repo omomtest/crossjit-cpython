@@ -139,7 +139,11 @@ initial_jump_backoff_counter(_PyOptimizationConfig *opt_config)
 // The reasoning is that we always want loop traces to form and inline
 // functions before functions themselves warm up and link to them instead
 // of inlining.
-#define RESUME_INITIAL_VALUE 8190
+/* Function-entry traces are filtered after Region lowering: only providers
+ * that produce an ENTRY_PROFITABLE Region retain the executor.  Starting the
+ * probe early makes straight-line external array pipelines visible without
+ * committing ordinary Python functions to premature Tier-2 code. */
+#define RESUME_INITIAL_VALUE 4
 #define RESUME_INITIAL_BACKOFF 6
 static inline _Py_BackoffCounter
 initial_resume_backoff_counter(_PyOptimizationConfig *opt_config)
