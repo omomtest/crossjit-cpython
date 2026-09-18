@@ -650,8 +650,6 @@ jit_ext_is_external_uop(uint16_t opcode)
     }
     return base_opcode == _EXT_BINARY_EXEC ||
            base_opcode == _EXT_COMPARE_EXEC ||
-           base_opcode == _EXT_FUSED_BINARY2_EXEC ||
-           base_opcode == _EXT_FUSED_BINARY2_RIGHT_EXEC ||
            base_opcode == _EXT_REGION_EXEC ||
            base_opcode == _EXT_CALL_EXEC ||
            base_opcode == _EXT_METHOD_CALL_EXEC;
@@ -672,76 +670,49 @@ jit_ext_plan_for_instruction(_PyExecutorObject *executor,
     return executor->ext_plans[plan_index];
 }
 
-static const PyJitExtStencil *
-jit_ext_stencil_for_instruction(_PyExecutorObject *executor,
-                                const _PyUOpInstruction *instruction)
-{
-    PyJitExtPlan *plan = jit_ext_plan_for_instruction(executor, instruction);
-    if (plan == NULL ||
-        plan->struct_size < offsetof(PyJitExtPlan, stencil) +
-                            sizeof(plan->stencil)) {
-        return NULL;
-    }
-    if (plan->struct_size >= offsetof(PyJitExtPlan, get_stencil) +
-                             sizeof(plan->get_stencil) &&
-        plan->get_stencil != NULL) {
-        return plan->get_stencil(plan, instruction->opcode);
-    }
-    return plan->stencil;
-}
-
 static uintptr_t
-jit_ext_stencil_hole_value(const PyJitExtStencilHole *hole,
-                           const PyJitExtStencil *stencil,
-                           const PyJitExtPlan *plan,
-                           const _PyUOpInstruction *instruction,
-                           const jit_state *state,
-                           size_t instruction_index,
-                           size_t code_size,
-                           size_t trace_length,
-                           int *ok)
+jit_ext_code_hole_value(const PyJitExtCodeHole *hole,
+                        const PyJitExtPlan *plan,
+                        const _PyUOpInstruction *instruction,
+                        const jit_state *state,
+                        size_t instruction_index,
+                        size_t code_size,
+                        size_t trace_length,
+                        int *ok)
 {
     switch (hole->value_kind) {
-        case PYJIT_EXT_STENCIL_VALUE_PLAN:
+        case PYJIT_EXT_CODE_VALUE_PLAN:
             return (uintptr_t)plan;
-        case PYJIT_EXT_STENCIL_VALUE_PAYLOAD:
+        case PYJIT_EXT_CODE_VALUE_PAYLOAD:
             return (uintptr_t)plan->payload;
-        case PYJIT_EXT_STENCIL_VALUE_BINARY_EVAL:
+        case PYJIT_EXT_CODE_VALUE_BINARY_EVAL:
             return (uintptr_t)plan->eval.binary_eval;
-        case PYJIT_EXT_STENCIL_VALUE_CALL_EVAL:
+        case PYJIT_EXT_CODE_VALUE_CALL_EVAL:
             return (uintptr_t)plan->eval.call_eval;
-        case PYJIT_EXT_STENCIL_VALUE_FUSED_BINARY2_EVAL:
-            return (uintptr_t)plan->eval.fused_binary2_eval;
-        case PYJIT_EXT_STENCIL_VALUE_REGION_EVAL:
+        case PYJIT_EXT_CODE_VALUE_REGION_EVAL:
             return (uintptr_t)plan->eval.region_eval;
-        case PYJIT_EXT_STENCIL_VALUE_REGION_FALLBACK_EVAL:
+        case PYJIT_EXT_CODE_VALUE_REGION_FALLBACK_EVAL:
             return (uintptr_t)plan->region_fallback_eval;
-        case PYJIT_EXT_STENCIL_VALUE_NEXT_INSTRUCTION:
+        case PYJIT_EXT_CODE_VALUE_NEXT_INSTRUCTION:
             return state->instruction_starts[instruction_index] + code_size;
-        case PYJIT_EXT_STENCIL_VALUE_TARGET:
+        case PYJIT_EXT_CODE_VALUE_TARGET:
             if (instruction->jump_target >= trace_length) {
                 *ok = 0;
                 return 0;
             }
             return state->instruction_starts[instruction->jump_target];
-        case PYJIT_EXT_STENCIL_VALUE_ERROR_TARGET:
+        case PYJIT_EXT_CODE_VALUE_ERROR_TARGET:
             if (instruction->error_target >= trace_length) {
                 *ok = 0;
                 return 0;
             }
             return state->instruction_starts[instruction->error_target];
-        case PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_HIT:
+        case PYJIT_EXT_CODE_VALUE_RECORD_EXT_HIT:
             return (uintptr_t)_PyJit_RecordExtHit;
-        case PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_MISS:
+        case PYJIT_EXT_CODE_VALUE_RECORD_EXT_MISS:
             return (uintptr_t)_Py_Executor_RecordExtMiss;
-        case PYJIT_EXT_STENCIL_VALUE_CUSTOM0:
-            return (uintptr_t)stencil->custom0;
-        case PYJIT_EXT_STENCIL_VALUE_CUSTOM1:
-            return (uintptr_t)stencil->custom1;
-        case PYJIT_EXT_STENCIL_VALUE_CUSTOM2:
-            return (uintptr_t)stencil->custom2;
-        case PYJIT_EXT_STENCIL_VALUE_CUSTOM3:
-            return (uintptr_t)stencil->custom3;
+        case PYJIT_EXT_CODE_VALUE_EXTERNAL:
+            return (uintptr_t)hole->value;
         default:
             *ok = 0;
             return 0;
@@ -749,92 +720,210 @@ jit_ext_stencil_hole_value(const PyJitExtStencilHole *hole,
 }
 
 static int
-jit_ext_emit_stencil(unsigned char *code, unsigned char *data,
-                     _PyExecutorObject *executor,
-                     const _PyUOpInstruction *instruction,
-                     const PyJitExtStencil *stencil,
-                     jit_state *state,
-                     size_t instruction_index,
-                     size_t trace_length)
+jit_ext_validate_code(const PyJitExtCode *ext_code, uint16_t opcode,
+                      const PyJitExtPlan *plan)
 {
-    PyJitExtPlan *plan = jit_ext_plan_for_instruction(executor, instruction);
-    if (plan == NULL || stencil == NULL ||
-        stencil->abi_version != PYJIT_EXT_ABI_VERSION ||
-        stencil->struct_size < sizeof(*stencil) ||
-        (stencil->code_size != 0 && stencil->code == NULL) ||
-        (stencil->data_size != 0 && stencil->data == NULL) ||
-        (stencil->hole_count != 0 && stencil->holes == NULL)) {
+    if (ext_code == NULL ||
+        ext_code->abi_version != PYJIT_EXT_ABI_VERSION ||
+        ext_code->struct_size < sizeof(*ext_code) ||
+        ext_code->code_size == 0 || ext_code->code == NULL ||
+        (ext_code->data_size != 0 && ext_code->data == NULL) ||
+        (ext_code->hole_count != 0 && ext_code->holes == NULL)) {
         PyErr_Format(
             PyExc_SystemError,
-            "invalid external JIT stencil (opcode=%u plan=%p kind=%d stencil=%p abi=%u)",
-            (unsigned)instruction->opcode, (void *)plan,
-            plan != NULL ? (int)plan->kind : -1, (void *)stencil,
-            stencil != NULL ? stencil->abi_version : 0);
+            "invalid external JIT code (opcode=%u plan=%p kind=%d code=%p abi=%u)",
+            (unsigned)opcode, (void *)plan,
+            plan != NULL ? (int)plan->kind : -1, (void *)ext_code,
+            ext_code != NULL ? ext_code->abi_version : 0);
         return -1;
     }
-    if (stencil->code_size != 0) {
-        memcpy(code, stencil->code, stencil->code_size);
-    }
-    if (stencil->data_size != 0) {
-        memcpy(data, stencil->data, stencil->data_size);
-    }
-
-    for (size_t i = 0; i < stencil->hole_count; i++) {
-        const PyJitExtStencilHole *hole = &stencil->holes[i];
-        unsigned char *base = NULL;
+    for (size_t i = 0; i < ext_code->hole_count; i++) {
+        const PyJitExtCodeHole *hole = &ext_code->holes[i];
         size_t section_size = 0;
-        if (hole->section == PYJIT_EXT_STENCIL_SECTION_CODE) {
-            base = code;
-            section_size = stencil->code_size;
+        if (hole->section == PYJIT_EXT_CODE_SECTION_CODE) {
+            section_size = ext_code->code_size;
         }
-        else if (hole->section == PYJIT_EXT_STENCIL_SECTION_DATA) {
-            base = data;
-            section_size = stencil->data_size;
+        else if (hole->section == PYJIT_EXT_CODE_SECTION_DATA) {
+            section_size = ext_code->data_size;
         }
         else {
             PyErr_SetString(PyExc_SystemError,
-                            "invalid external JIT stencil section");
+                            "invalid external JIT code section");
             return -1;
         }
-        size_t patch_size = hole->patch_kind == PYJIT_EXT_STENCIL_PATCH_ABS64 ?
-                            sizeof(uint64_t) : sizeof(uint32_t);
+        size_t patch_size;
+        if (hole->patch_kind == PYJIT_EXT_CODE_PATCH_ABS64) {
+            patch_size = sizeof(uint64_t);
+        }
+        else if (hole->patch_kind == PYJIT_EXT_CODE_PATCH_REL32) {
+            patch_size = sizeof(uint32_t);
+        }
+        else {
+            PyErr_SetString(PyExc_SystemError,
+                            "invalid external JIT code patch kind");
+            return -1;
+        }
         if ((size_t)hole->offset > section_size ||
             patch_size > section_size - (size_t)hole->offset) {
             PyErr_SetString(PyExc_SystemError,
-                            "external JIT stencil patch is out of bounds");
+                            "external JIT code patch is out of bounds");
             return -1;
         }
+    }
+    return 0;
+}
+
+static int
+jit_ext_emit_code(unsigned char *code, unsigned char *data,
+                  const _PyUOpInstruction *instruction,
+                  const PyJitExtCode *ext_code,
+                  const PyJitExtPlan *plan,
+                  jit_state *state,
+                  size_t instruction_index,
+                  size_t trace_length)
+{
+    if (ext_code->code_size != 0) {
+        memcpy(code, ext_code->code, ext_code->code_size);
+    }
+    if (ext_code->data_size != 0) {
+        memcpy(data, ext_code->data, ext_code->data_size);
+    }
+
+    for (size_t i = 0; i < ext_code->hole_count; i++) {
+        const PyJitExtCodeHole *hole = &ext_code->holes[i];
+        unsigned char *base = hole->section == PYJIT_EXT_CODE_SECTION_CODE ?
+                              code : data;
         unsigned char *loc = base + hole->offset;
         int ok = 1;
-        uintptr_t value = jit_ext_stencil_hole_value(
-            hole, stencil, plan, instruction, state, instruction_index,
-            stencil->code_size, trace_length, &ok);
+        uintptr_t value = jit_ext_code_hole_value(
+            hole, plan, instruction, state, instruction_index,
+            ext_code->code_size, trace_length, &ok);
         if (!ok) {
             PyErr_SetString(PyExc_SystemError,
-                            "invalid external JIT stencil hole value");
+                            "invalid external JIT code hole value");
             return -1;
         }
         value += (uintptr_t)hole->addend;
-        if (hole->patch_kind == PYJIT_EXT_STENCIL_PATCH_ABS64) {
+        if (hole->patch_kind == PYJIT_EXT_CODE_PATCH_ABS64) {
             uint64_t patched = (uint64_t)value;
             memcpy(loc, &patched, sizeof(patched));
         }
-        else if (hole->patch_kind == PYJIT_EXT_STENCIL_PATCH_REL32) {
+        else {
+            assert(hole->patch_kind == PYJIT_EXT_CODE_PATCH_REL32);
             int64_t rel = (int64_t)value - ((int64_t)(uintptr_t)loc + 4);
             if (rel < INT32_MIN || rel > INT32_MAX) {
                 PyErr_SetString(PyExc_SystemError,
-                                "external JIT stencil rel32 patch is out of range");
+                                "external JIT code rel32 patch is out of range");
                 return -1;
             }
             int32_t patched = (int32_t)rel;
             memcpy(loc, &patched, sizeof(patched));
         }
-        else {
-            PyErr_SetString(PyExc_SystemError,
-                            "invalid external JIT stencil patch kind");
+    }
+    return 0;
+}
+
+typedef struct {
+    const StencilGroup *native;
+    const PyJitExtCode *external;
+    PyJitExtPlan *plan;
+} JitInstructionCode;
+
+/* Resolve the code before sizing the allocation.  Every later compilation
+ * step is shared with native JIT code; only this provider interaction differs
+ * for an external uop. */
+static int
+jit_instruction_code_resolve(_PyExecutorObject *executor,
+                             const _PyUOpInstruction *instruction,
+                             JitInstructionCode *resolved)
+{
+    if (instruction->opcode >= Py_ARRAY_LENGTH(stencil_groups)) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid uop %u while compiling JIT code",
+                     (unsigned)instruction->opcode);
+        return -1;
+    }
+    resolved->native = &stencil_groups[instruction->opcode];
+    resolved->external = NULL;
+    resolved->plan = jit_ext_plan_for_instruction(executor, instruction);
+
+    PyJitExtPlan *plan = resolved->plan;
+    PyJitExtProvider *provider = plan != NULL ? plan->provider : NULL;
+    if (provider != NULL && provider->get_code != NULL) {
+        resolved->external = provider->get_code(plan, instruction->opcode);
+        if (resolved->external == NULL && PyErr_Occurred()) {
+            return -1;
+        }
+        if (resolved->external != NULL &&
+            jit_ext_validate_code(
+                resolved->external, instruction->opcode, plan) < 0) {
             return -1;
         }
     }
+    if (resolved->external == NULL && resolved->native->emit == NULL) {
+        PyErr_Format(PyExc_SystemError,
+                     "missing JIT code for uop %u",
+                     (unsigned)instruction->opcode);
+        return -1;
+    }
+    return 0;
+}
+
+static size_t
+jit_instruction_code_size(const JitInstructionCode *code)
+{
+    return code->external != NULL ? code->external->code_size :
+                                    code->native->code_size;
+}
+
+static size_t
+jit_instruction_data_size(const JitInstructionCode *code)
+{
+    return code->external != NULL ? code->external->data_size :
+                                    code->native->data_size;
+}
+
+static int
+jit_size_add(size_t *total, size_t increment)
+{
+    if (increment > SIZE_MAX - *total) {
+        PyErr_SetString(PyExc_OverflowError,
+                        "external JIT code allocation is too large");
+        return -1;
+    }
+    *total += increment;
+    return 0;
+}
+
+static void
+jit_instruction_code_add_symbols(const JitInstructionCode *code,
+                                 jit_state *state)
+{
+    if (code->external == NULL) {
+        combine_symbol_mask(code->native->trampoline_mask,
+                            state->trampolines.mask);
+        combine_symbol_mask(code->native->got_mask,
+                            state->got_symbols.mask);
+    }
+}
+
+static int
+jit_instruction_code_emit(const JitInstructionCode *code,
+                          unsigned char *code_buffer,
+                          unsigned char *data_buffer,
+                          _PyExecutorObject *executor,
+                          const _PyUOpInstruction *instruction,
+                          jit_state *state,
+                          size_t instruction_index,
+                          size_t trace_length)
+{
+    if (code->external != NULL) {
+        return jit_ext_emit_code(
+            code_buffer, data_buffer, instruction, code->external,
+            code->plan, state, instruction_index, trace_length);
+    }
+    code->native->emit(
+        code_buffer, data_buffer, executor, instruction, state);
     return 0;
 }
 
@@ -851,37 +940,44 @@ _PyJIT_UopHasStencil(int opcode)
 int
 _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], size_t length)
 {
-    const StencilGroup *group;
+    if (length == 0 || length > UOP_MAX_TRACE_LENGTH) {
+        PyErr_Format(PyExc_SystemError,
+                     "invalid JIT trace length %zu", length);
+        return -1;
+    }
+    JitInstructionCode *resolved = PyMem_Malloc(
+        length * sizeof(*resolved));
+    if (resolved == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
     // Loop once to find the total compiled size:
     size_t code_size = 0;
     size_t data_size = 0;
     jit_state state = {0};
     for (size_t i = 0; i < length; i++) {
         const _PyUOpInstruction *instruction = &trace[i];
-        const PyJitExtStencil *ext_stencil =
-            jit_ext_stencil_for_instruction(executor, instruction);
+        if (jit_instruction_code_resolve(
+                executor, instruction, &resolved[i]) < 0) {
+            PyMem_Free(resolved);
+            return -1;
+        }
         state.instruction_starts[i] = code_size;
-        if (ext_stencil != NULL) {
-            code_size += ext_stencil->code_size;
-            data_size += ext_stencil->data_size;
+        if (jit_size_add(
+                &code_size, jit_instruction_code_size(&resolved[i])) < 0 ||
+            jit_size_add(
+                &data_size, jit_instruction_data_size(&resolved[i])) < 0) {
+            PyMem_Free(resolved);
+            return -1;
         }
-        else {
-            group = &stencil_groups[instruction->opcode];
-            if (group->emit == NULL) {
-                PyErr_Format(PyExc_SystemError,
-                             "missing JIT stencil for uop %d",
-                             instruction->opcode);
-                return -1;
-            }
-            code_size += group->code_size;
-            data_size += group->data_size;
-            combine_symbol_mask(group->trampoline_mask, state.trampolines.mask);
-            combine_symbol_mask(group->got_mask, state.got_symbols.mask);
-        }
+        jit_instruction_code_add_symbols(&resolved[i], &state);
     }
-    group = &stencil_groups[_FATAL_ERROR_r00];
-    code_size += group->code_size;
-    data_size += group->data_size;
+    const StencilGroup *group = &stencil_groups[_FATAL_ERROR_r00];
+    if (jit_size_add(&code_size, group->code_size) < 0 ||
+        jit_size_add(&data_size, group->data_size) < 0) {
+        PyMem_Free(resolved);
+        return -1;
+    }
     combine_symbol_mask(group->trampoline_mask, state.trampolines.mask);
     combine_symbol_mask(group->got_mask, state.got_symbols.mask);
     // Calculate the size of the trampolines required by the whole trace
@@ -894,11 +990,26 @@ _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], siz
     // Round up to the nearest page:
     size_t page_size = get_page_size();
     assert((page_size & (page_size - 1)) == 0);
-    size_t code_padding = DATA_ALIGN - ((code_size + state.trampolines.size) & (DATA_ALIGN - 1));
-    size_t padding = page_size - ((code_size + state.trampolines.size + code_padding + data_size + state.got_symbols.size) & (page_size - 1));
-    size_t total_size = code_size + state.trampolines.size + code_padding + data_size + state.got_symbols.size + padding;
+    size_t total_size = code_size;
+    if (jit_size_add(&total_size, state.trampolines.size) < 0) {
+        PyMem_Free(resolved);
+        return -1;
+    }
+    size_t code_padding = DATA_ALIGN - (total_size & (DATA_ALIGN - 1));
+    if (jit_size_add(&total_size, code_padding) < 0 ||
+        jit_size_add(&total_size, data_size) < 0 ||
+        jit_size_add(&total_size, state.got_symbols.size) < 0) {
+        PyMem_Free(resolved);
+        return -1;
+    }
+    size_t padding = page_size - (total_size & (page_size - 1));
+    if (jit_size_add(&total_size, padding) < 0) {
+        PyMem_Free(resolved);
+        return -1;
+    }
     unsigned char *memory = jit_alloc(total_size);
     if (memory == NULL) {
+        PyMem_Free(resolved);
         return -1;
     }
     // Collect memory stats
@@ -921,23 +1032,15 @@ _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], siz
     state.got_symbols.mem = data + data_size;
     for (size_t i = 0; i < length; i++) {
         const _PyUOpInstruction *instruction = &trace[i];
-        const PyJitExtStencil *ext_stencil =
-            jit_ext_stencil_for_instruction(executor, instruction);
-        if (ext_stencil != NULL) {
-            if (jit_ext_emit_stencil(code, data, executor, instruction,
-                                     ext_stencil, &state, i, length) < 0) {
-                jit_free(memory, total_size);
-                return -1;
-            }
-            code += ext_stencil->code_size;
-            data += ext_stencil->data_size;
+        if (jit_instruction_code_emit(
+                &resolved[i], code, data, executor, instruction,
+                &state, i, length) < 0) {
+            jit_free(memory, total_size);
+            PyMem_Free(resolved);
+            return -1;
         }
-        else {
-            group = &stencil_groups[instruction->opcode];
-            group->emit(code, data, executor, instruction, &state);
-            code += group->code_size;
-            data += group->data_size;
-        }
+        code += jit_instruction_code_size(&resolved[i]);
+        data += jit_instruction_data_size(&resolved[i]);
     }
     // Protect against accidental buffer overrun into data:
     group = &stencil_groups[_FATAL_ERROR_r00];
@@ -948,6 +1051,7 @@ _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], siz
     assert(data == memory + code_size + state.trampolines.size + code_padding + data_size);
     if (mark_executable(memory, total_size)) {
         jit_free(memory, total_size);
+        PyMem_Free(resolved);
         return -1;
     }
     executor->jit_code = memory;
@@ -957,6 +1061,7 @@ _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], siz
         code_size + state.trampolines.size,
         "jit",
         "executor");
+    PyMem_Free(resolved);
     return 0;
 }
 

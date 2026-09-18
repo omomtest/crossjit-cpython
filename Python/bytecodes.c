@@ -826,114 +826,40 @@ dummy_func(
             res = PyStackRef_FromPyObjectSteal(res_o);
         }
 
-        op(_EXT_FUSED_BINARY2_EXEC, (plan_index/1, first_left, first_right, second_other -- res, l, r, o)) {
-            EXIT_IF(plan_index >= current_executor->ext_plan_count);
-            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
-            PyObject *first_left_o = PyStackRef_AsPyObjectBorrow(first_left);
-            PyObject *first_right_o = PyStackRef_AsPyObjectBorrow(first_right);
-            PyObject *second_other_o = PyStackRef_AsPyObjectBorrow(second_other);
-            EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_FUSED_BINARY2 ||
-                    plan->eval.fused_binary2_eval == NULL);
-
-            PyObject *res_o = NULL;
-            PyJitExtResult jit_res = plan->eval.fused_binary2_eval(
-                plan->payload, first_left_o, first_right_o, second_other_o,
-                &res_o);
-            if (jit_res == PYJIT_EXT_MISS) {
-                _Py_Executor_RecordExtMiss(current_executor, plan);
-                EXIT_IF(true);
-            }
-            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
-                ERROR_NO_POP();
-            }
-            _PyJit_RecordExtHit(plan);
-
-            res = PyStackRef_FromPyObjectSteal(res_o);
-            l = first_left;
-            r = first_right;
-            o = second_other;
-            INPUTS_DEAD();
-        }
-
-        op(_EXT_FUSED_BINARY2_RIGHT_EXEC, (plan_index/1, second_other, first_left, first_right -- res, o, l, r)) {
-            EXIT_IF(plan_index >= current_executor->ext_plan_count);
-            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
-            PyObject *first_left_o = PyStackRef_AsPyObjectBorrow(first_left);
-            PyObject *first_right_o = PyStackRef_AsPyObjectBorrow(first_right);
-            PyObject *second_other_o = PyStackRef_AsPyObjectBorrow(second_other);
-            EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_FUSED_BINARY2 ||
-                    plan->eval.fused_binary2_eval == NULL);
-
-            PyObject *res_o = NULL;
-            PyJitExtResult jit_res = plan->eval.fused_binary2_eval(
-                plan->payload, first_left_o, first_right_o, second_other_o,
-                &res_o);
-            if (jit_res == PYJIT_EXT_MISS) {
-                _Py_Executor_RecordExtMiss(current_executor, plan);
-                EXIT_IF(true);
-            }
-            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
-                ERROR_NO_POP();
-            }
-            _PyJit_RecordExtHit(plan);
-
-            res = PyStackRef_FromPyObjectSteal(res_o);
-            o = second_other;
-            l = first_left;
-            r = first_right;
-            INPUTS_DEAD();
-        }
-
         op(_EXT_REGION_EXEC, (plan_index/1, args[oparg] -- res)) {
             EXIT_IF(plan_index >= current_executor->ext_plan_count);
             PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
-            EXIT_IF(plan == NULL || plan->kind != PYJIT_EXT_PLAN_REGION ||
-                    plan->eval.region_eval == NULL ||
-                    oparg != plan->region_input_count ||
-                    oparg > PYJIT_EXT_REGION_MAX_INPUTS);
+            EXIT_IF(plan == NULL || oparg != plan->region_input_count);
 
-            PyObject *args_o[PYJIT_EXT_REGION_MAX_INPUTS];
-            for (int i = 0; i < oparg; i++) {
-                args_o[i] = PyStackRef_AsPyObjectBorrow(args[i]);
-            }
-            PyObject *res_o = NULL;
-            int fast_hit = 1;
-            PyJitExtResult jit_res = plan->eval.region_eval(
-                plan->payload, (PyObject *const *)args_o, oparg, &res_o);
-            if (jit_res == PYJIT_EXT_COLD) {
-                fast_hit = 0;
-                if (plan->site != NULL &&
-                    plan->site->region_fallback_count != UINT16_MAX) {
-                    plan->site->region_fallback_count++;
+            PyObject *res_o = _PyJitExt_RunRegion(
+                current_executor, plan, args, oparg);
+            if (res_o == NULL) {
+                if (PyErr_Occurred()) {
+                    ERROR_NO_POP();
                 }
-            }
-            else if (jit_res == PYJIT_EXT_MISS) {
-                fast_hit = 0;
-                _Py_Executor_RecordExtMiss(current_executor, plan);
-                if (plan->site != NULL &&
-                    plan->site->region_fallback_count != UINT16_MAX) {
-                    plan->site->region_fallback_count++;
-                }
-                if (plan->region_fallback_eval == NULL) {
-                    EXIT_IF(true);
-                }
-                jit_res = plan->region_fallback_eval(
-                    plan->payload, (PyObject *const *)args_o, oparg, &res_o);
-            }
-            if (jit_res == PYJIT_EXT_ERROR || res_o == NULL) {
-                if (plan->site != NULL &&
-                    plan->site->region_error_count != UINT16_MAX) {
-                    plan->site->region_error_count++;
-                }
-                ERROR_NO_POP();
-            }
-            if (fast_hit) {
-                _PyJit_RecordExtHit(plan);
+                EXIT_IF(true);
             }
             _PyStackRef_CloseStack(args, oparg);
             DEAD(args);
             INPUTS_DEAD();
             res = PyStackRef_FromPyObjectSteal(res_o);
+        }
+
+        op(_EXT_REGION_STORE, (plan_index/1,
+                               args[oparg], destination, start, stop -- )) {
+            EXIT_IF(plan_index >= current_executor->ext_plan_count);
+            PyJitExtPlan *plan = current_executor->ext_plans[plan_index];
+            EXIT_IF(plan == NULL || oparg != plan->region_input_count);
+            PyJitExtResult status = _PyJitExt_RunRegionStore(
+                current_executor, plan, args, oparg,
+                PyStackRef_AsPyObjectBorrow(destination),
+                PyStackRef_AsPyObjectBorrow(start),
+                PyStackRef_AsPyObjectBorrow(stop));
+            if (status == PYJIT_EXT_MISS) {
+                EXIT_IF(true);
+            }
+            DECREF_INPUTS();
+            ERROR_IF(status != PYJIT_EXT_HIT);
         }
 
         op(_EXT_CALL_EXEC, (plan_index/1, callable, self_or_null, args[oparg] -- res)) {

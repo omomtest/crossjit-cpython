@@ -217,6 +217,19 @@ void _Py_ExecutorDetach(_PyExecutorObject *);
 PyAPI_FUNC(void) _Py_Executor_DependsOn(_PyExecutorObject *executor, void *obj);
 void _PyJit_RecordExtHit(PyJitExtPlan *plan);
 void _Py_Executor_RecordExtMiss(_PyExecutorObject *executor, PyJitExtPlan *plan);
+PyObject *_PyJitExt_RunRegion(
+    _PyExecutorObject *executor,
+    PyJitExtPlan *plan,
+    const _PyStackRef *stack_args,
+    Py_ssize_t nargs);
+PyJitExtResult _PyJitExt_RunRegionStore(
+    _PyExecutorObject *executor,
+    PyJitExtPlan *plan,
+    const _PyStackRef *stack_args,
+    Py_ssize_t nargs,
+    PyObject *destination,
+    PyObject *start,
+    PyObject *stop);
 int _PyJitExtEnableSiteDisable(void);
 int _PyJitExtLookupOnly(void);
 int _PyJitExtPlanNoEmit(void);

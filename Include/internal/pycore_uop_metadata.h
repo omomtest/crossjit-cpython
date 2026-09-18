@@ -118,9 +118,8 @@ const uint32_t _PyUop_Flags[MAX_UOP_ID+1] = {
     [_GUARD_TOS_FLOAT] = HAS_EXIT_FLAG,
     [_EXT_BINARY_EXEC] = HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
     [_EXT_COMPARE_EXEC] = HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
-    [_EXT_FUSED_BINARY2_EXEC] = HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
-    [_EXT_FUSED_BINARY2_RIGHT_EXEC] = HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
     [_EXT_REGION_EXEC] = HAS_ARG_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
+    [_EXT_REGION_STORE] = HAS_ARG_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ESCAPES_FLAG,
     [_EXT_CALL_EXEC] = HAS_ARG_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
     [_EXT_METHOD_CALL_EXEC] = HAS_ARG_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
     [_BINARY_OP_MULTIPLY_FLOAT] = HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_PURE_FLAG,
@@ -1203,24 +1202,6 @@ const _PyUopCachingInfo _PyUop_Caching[MAX_UOP_ID+1] = {
             { -1, -1, -1 },
         },
     },
-    [_EXT_FUSED_BINARY2_EXEC] = {
-        .best = { 3, 3, 3, 3 },
-        .entries = {
-            { -1, -1, -1 },
-            { -1, -1, -1 },
-            { -1, -1, -1 },
-            { 3, 3, _EXT_FUSED_BINARY2_EXEC_r33 },
-        },
-    },
-    [_EXT_FUSED_BINARY2_RIGHT_EXEC] = {
-        .best = { 3, 3, 3, 3 },
-        .entries = {
-            { -1, -1, -1 },
-            { -1, -1, -1 },
-            { -1, -1, -1 },
-            { 3, 3, _EXT_FUSED_BINARY2_RIGHT_EXEC_r33 },
-        },
-    },
     [_EXT_REGION_EXEC] = {
         .best = { 0, 0, 0, 0 },
         .entries = {
@@ -1228,6 +1209,15 @@ const _PyUopCachingInfo _PyUop_Caching[MAX_UOP_ID+1] = {
             { -1, -1, -1 },
             { -1, -1, -1 },
             { -1, -1, -1 },
+        },
+    },
+    [_EXT_REGION_STORE] = {
+        .best = { 3, 3, 3, 3 },
+        .entries = {
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+            { 0, 3, _EXT_REGION_STORE_r30 },
         },
     },
     [_EXT_CALL_EXEC] = {
@@ -4260,9 +4250,8 @@ const uint16_t _PyUop_Uncached[MAX_UOP_REGS_ID+1] = {
     [_GUARD_TOS_FLOAT_r33] = _GUARD_TOS_FLOAT,
     [_EXT_BINARY_EXEC_r23] = _EXT_BINARY_EXEC,
     [_EXT_COMPARE_EXEC_r21] = _EXT_COMPARE_EXEC,
-    [_EXT_FUSED_BINARY2_EXEC_r33] = _EXT_FUSED_BINARY2_EXEC,
-    [_EXT_FUSED_BINARY2_RIGHT_EXEC_r33] = _EXT_FUSED_BINARY2_RIGHT_EXEC,
     [_EXT_REGION_EXEC_r01] = _EXT_REGION_EXEC,
+    [_EXT_REGION_STORE_r30] = _EXT_REGION_STORE,
     [_EXT_CALL_EXEC_r01] = _EXT_CALL_EXEC,
     [_EXT_METHOD_CALL_EXEC_r00] = _EXT_METHOD_CALL_EXEC,
     [_BINARY_OP_MULTIPLY_FLOAT_r03] = _BINARY_OP_MULTIPLY_FLOAT,
@@ -5327,14 +5316,12 @@ const char *const _PyOpcode_uop_name[MAX_UOP_REGS_ID+1] = {
     [_EXT_CALL_EXEC_r01] = "_EXT_CALL_EXEC_r01",
     [_EXT_COMPARE_EXEC] = "_EXT_COMPARE_EXEC",
     [_EXT_COMPARE_EXEC_r21] = "_EXT_COMPARE_EXEC_r21",
-    [_EXT_FUSED_BINARY2_EXEC] = "_EXT_FUSED_BINARY2_EXEC",
-    [_EXT_FUSED_BINARY2_EXEC_r33] = "_EXT_FUSED_BINARY2_EXEC_r33",
-    [_EXT_FUSED_BINARY2_RIGHT_EXEC] = "_EXT_FUSED_BINARY2_RIGHT_EXEC",
-    [_EXT_FUSED_BINARY2_RIGHT_EXEC_r33] = "_EXT_FUSED_BINARY2_RIGHT_EXEC_r33",
     [_EXT_METHOD_CALL_EXEC] = "_EXT_METHOD_CALL_EXEC",
     [_EXT_METHOD_CALL_EXEC_r00] = "_EXT_METHOD_CALL_EXEC_r00",
     [_EXT_REGION_EXEC] = "_EXT_REGION_EXEC",
     [_EXT_REGION_EXEC_r01] = "_EXT_REGION_EXEC_r01",
+    [_EXT_REGION_STORE] = "_EXT_REGION_STORE",
+    [_EXT_REGION_STORE_r30] = "_EXT_REGION_STORE_r30",
     [_FATAL_ERROR] = "_FATAL_ERROR",
     [_FATAL_ERROR_r00] = "_FATAL_ERROR_r00",
     [_FATAL_ERROR_r11] = "_FATAL_ERROR_r11",
@@ -6481,12 +6468,10 @@ int _PyUop_num_popped(int opcode, int oparg)
             return 2;
         case _EXT_COMPARE_EXEC:
             return 2;
-        case _EXT_FUSED_BINARY2_EXEC:
-            return 3;
-        case _EXT_FUSED_BINARY2_RIGHT_EXEC:
-            return 3;
         case _EXT_REGION_EXEC:
             return oparg;
+        case _EXT_REGION_STORE:
+            return 3 + oparg;
         case _EXT_CALL_EXEC:
             return 2 + oparg;
         case _EXT_METHOD_CALL_EXEC:

@@ -9,16 +9,17 @@ extern "C" {
 /*
  * Experimental external JIT plan API (non-limited C API).
  *
- * CPython owns provider lookup and executor lifetime. Extension modules own
- * plan payloads and run their own guards, allocation, and kernels from eval().
+ * CPython owns provider lookup, executor lifetime, executable allocation, and
+ * code patching. Extension modules own plan payloads and run their own guards
+ * and kernels from eval().
  */
 
-#define PYJIT_EXT_ABI_VERSION 7u
+#define PYJIT_EXT_ABI_VERSION 12u
 #define PYJIT_EXT_CORE_IR_VERSION 1u
 
-#define PYJIT_EXT_REGION_MAX_NODES 6
-#define PYJIT_EXT_REGION_MAX_INPUTS 8
-#define PYJIT_EXT_REGION_MAX_NODE_INPUTS 3
+#define PYJIT_EXT_REGION_MAX_NODES 12
+#define PYJIT_EXT_REGION_MAX_INPUTS 16
+#define PYJIT_EXT_REGION_MAX_NODE_INPUTS PYJIT_EXT_REGION_MAX_INPUTS
 #define PYJIT_EXT_REGION_PIC_SIZE 4
 #define PYJIT_EXT_UNARY_NEGATIVE 1
 
@@ -32,15 +33,15 @@ typedef enum {
 typedef enum {
     PYJIT_EXT_TRACE_BINARY,
     PYJIT_EXT_TRACE_CALL,
-    PYJIT_EXT_TRACE_FUSED_BINARY2,
-    PYJIT_EXT_TRACE_REGION,
     PYJIT_EXT_TRACE_UNARY,
+    PYJIT_EXT_TRACE_REGION,
 } PyJitExtTraceKind;
 
 typedef struct _PyJitExtProvider PyJitExtProvider;
 typedef struct _PyJitExtPlan PyJitExtPlan;
 typedef struct _PyJitExtSiteState PyJitExtSiteState;
 typedef struct _PyJitExtLoweredRegion PyJitExtLoweredRegion;
+typedef struct _PyJitExtCode PyJitExtCode;
 
 typedef uint16_t PyJitExtValueId;
 typedef uint64_t PyJitExtDialectId;
@@ -106,6 +107,26 @@ typedef PyJitExtResult (*PyJitExtRegionEvalFunc)(
     Py_ssize_t nargs,
     PyObject **result);
 
+/* Optional Region steady-state entry.  A non-NULL result is a new reference
+   and means HIT.  NULL with an exception means ERROR; NULL without an
+   exception asks CPython to enter the complete region_eval slow path. */
+typedef PyObject *(*PyJitExtRegionFastEvalFunc)(
+    void *payload,
+    PyObject *const *args,
+    Py_ssize_t nargs);
+
+/* Experimental zero-result Region terminal for an exact basic-slice store.
+   Implementations must either complete the store or replay the original
+   Region and store before returning MISS; CPython therefore never exposes a
+   partially-written destination on a guard miss. */
+typedef PyJitExtResult (*PyJitExtRegionStoreEvalFunc)(
+    void *payload,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    PyObject *destination,
+    PyObject *start,
+    PyObject *stop);
+
 struct _PyJitExtLoweredRegion {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -135,17 +156,9 @@ typedef struct {
             uint32_t call_flags;
             PyObject *kwnames;
         } call;
-        struct {
-            PyJitExtPlan *first_plan;
-            PyJitExtPlan *second_plan;
-            uint32_t flags;
-        } fused_binary2;
         PyJitExtRegionRequest region;
     } u;
 } PyJitExtTraceRequest;
-
-#define PYJIT_EXT_FUSED_BINARY2_SECOND_CONSUMES_LEFT   (1u << 0)
-#define PYJIT_EXT_FUSED_BINARY2_SECOND_CONSUMES_RIGHT  (1u << 1)
 
 typedef struct {
     uint32_t abi_version;
@@ -160,8 +173,6 @@ typedef struct {
     const char *result_dtype;
     int itemsize;
     int64_t min_elements;
-    const char *fused_op_name;
-    const char *fused_pattern;
 } PyJitExtPlanInfo;
 
 struct _PyJitExtProvider {
@@ -194,12 +205,22 @@ struct _PyJitExtProvider {
     uint16_t dialect_version;
     uint16_t core_ir_version;
     uint32_t core_ir_features;
+    /* Return provider-owned, immutable code for this plan/uop, or NULL to
+       use CPython's native stencil. The descriptor must remain valid until
+       the plan is freed; ownership is not transferred. */
+    const PyJitExtCode *(*get_code)(
+        const PyJitExtPlan *plan,
+        int opcode);
+    /* Provider-neutral Core IR capacity.  CPython never interprets a
+       provider's nodes; these bounds only cap canonical Region discovery.
+       Providers without prepare_region may leave both fields zero. */
+    uint16_t max_region_nodes;
+    uint16_t max_region_inputs;
 };
 
 typedef enum {
     PYJIT_EXT_PLAN_BINARY,
     PYJIT_EXT_PLAN_CALL,
-    PYJIT_EXT_PLAN_FUSED_BINARY2,
     PYJIT_EXT_PLAN_REGION,
     PYJIT_EXT_PLAN_UNARY,
 } PyJitExtPlanKind;
@@ -223,41 +244,31 @@ typedef PyJitExtResult (*PyJitExtCallEvalFunc)(
     Py_ssize_t nargs,
     PyObject **result);
 
-typedef PyJitExtResult (*PyJitExtFusedBinary2EvalFunc)(
-    void *payload,
-    PyObject *first_left,
-    PyObject *first_right,
-    PyObject *second_other,
-    PyObject **result);
+typedef enum {
+    PYJIT_EXT_CODE_PATCH_ABS64,
+    PYJIT_EXT_CODE_PATCH_REL32,
+} PyJitExtCodePatchKind;
 
 typedef enum {
-    PYJIT_EXT_STENCIL_PATCH_ABS64,
-    PYJIT_EXT_STENCIL_PATCH_REL32,
-} PyJitExtStencilPatchKind;
+    PYJIT_EXT_CODE_VALUE_PLAN,
+    PYJIT_EXT_CODE_VALUE_PAYLOAD,
+    PYJIT_EXT_CODE_VALUE_BINARY_EVAL,
+    PYJIT_EXT_CODE_VALUE_CALL_EVAL,
+    PYJIT_EXT_CODE_VALUE_REGION_EVAL,
+    PYJIT_EXT_CODE_VALUE_REGION_FALLBACK_EVAL,
+    PYJIT_EXT_CODE_VALUE_NEXT_INSTRUCTION,
+    PYJIT_EXT_CODE_VALUE_TARGET,
+    PYJIT_EXT_CODE_VALUE_ERROR_TARGET,
+    PYJIT_EXT_CODE_VALUE_RECORD_EXT_HIT,
+    PYJIT_EXT_CODE_VALUE_RECORD_EXT_MISS,
+    /* Provider-specific address stored in PyJitExtCodeHole.value. */
+    PYJIT_EXT_CODE_VALUE_EXTERNAL,
+} PyJitExtCodeValueKind;
 
 typedef enum {
-    PYJIT_EXT_STENCIL_VALUE_PLAN,
-    PYJIT_EXT_STENCIL_VALUE_PAYLOAD,
-    PYJIT_EXT_STENCIL_VALUE_BINARY_EVAL,
-    PYJIT_EXT_STENCIL_VALUE_CALL_EVAL,
-    PYJIT_EXT_STENCIL_VALUE_FUSED_BINARY2_EVAL,
-    PYJIT_EXT_STENCIL_VALUE_REGION_EVAL,
-    PYJIT_EXT_STENCIL_VALUE_REGION_FALLBACK_EVAL,
-    PYJIT_EXT_STENCIL_VALUE_NEXT_INSTRUCTION,
-    PYJIT_EXT_STENCIL_VALUE_TARGET,
-    PYJIT_EXT_STENCIL_VALUE_ERROR_TARGET,
-    PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_HIT,
-    PYJIT_EXT_STENCIL_VALUE_RECORD_EXT_MISS,
-    PYJIT_EXT_STENCIL_VALUE_CUSTOM0,
-    PYJIT_EXT_STENCIL_VALUE_CUSTOM1,
-    PYJIT_EXT_STENCIL_VALUE_CUSTOM2,
-    PYJIT_EXT_STENCIL_VALUE_CUSTOM3,
-} PyJitExtStencilValueKind;
-
-typedef enum {
-    PYJIT_EXT_STENCIL_SECTION_CODE,
-    PYJIT_EXT_STENCIL_SECTION_DATA,
-} PyJitExtStencilSection;
+    PYJIT_EXT_CODE_SECTION_CODE,
+    PYJIT_EXT_CODE_SECTION_DATA,
+} PyJitExtCodeSection;
 
 typedef struct {
     uint32_t offset;
@@ -266,26 +277,19 @@ typedef struct {
     uint16_t value_kind;
     uint16_t reserved;
     int64_t addend;
-} PyJitExtStencilHole;
+    const void *value;
+} PyJitExtCodeHole;
 
-typedef struct {
+struct _PyJitExtCode {
     uint32_t abi_version;
     uint32_t struct_size;
     const unsigned char *code;
     size_t code_size;
     const unsigned char *data;
     size_t data_size;
-    const PyJitExtStencilHole *holes;
+    const PyJitExtCodeHole *holes;
     size_t hole_count;
-    const void *custom0;
-    const void *custom1;
-    const void *custom2;
-    const void *custom3;
-} PyJitExtStencil;
-
-typedef const PyJitExtStencil *(*PyJitExtGetStencilFunc)(
-    const PyJitExtPlan *plan,
-    int opcode);
+};
 
 struct _PyJitExtPlan {
     uint32_t abi_version;
@@ -298,15 +302,12 @@ struct _PyJitExtPlan {
     union {
         PyJitExtBinaryEvalFunc binary_eval;
         PyJitExtCallEvalFunc call_eval;
-        PyJitExtFusedBinary2EvalFunc fused_binary2_eval;
         PyJitExtRegionEvalFunc region_eval;
         PyJitExtUnaryEvalFunc unary_eval;
     } eval;
     void (*free_payload)(void *payload);
     const char *debug_name;
     PyJitExtSiteState *site;
-    const PyJitExtStencil *stencil;
-    PyJitExtGetStencilFunc get_stencil;
     PyJitExtRegionEvalFunc region_fallback_eval;
     uint32_t effect_flags;
     int8_t mutation_input;
@@ -314,6 +315,8 @@ struct _PyJitExtPlan {
     uint8_t op_domain;
     uint8_t output_count;
     uint16_t semantic_version;
+    PyJitExtRegionFastEvalFunc region_fast_eval;
+    PyJitExtRegionStoreEvalFunc region_store_eval;
 };
 
 #define PYJIT_EXT_PLAN_REQUIRES_GIL          (1u << 0)
@@ -358,10 +361,8 @@ typedef enum {
     PYJIT_EXT_BINARY_ADMISSION_UNSUPPORTED_TYPE_PAIR,
     PYJIT_EXT_BINARY_ADMISSION_PROVIDER_NOT_FOUND,
     PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED,
-    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_NUMPY_SHAPE_MISMATCH,
-    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_NUMPY_SCALAR_ARRAY_NOT_C_CONTIGUOUS,
+    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_PROVIDER_POLICY,
     PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_MISS_THRESHOLD,
-    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_STRIDED_MIN_ELEMENTS,
     PYJIT_EXT_BINARY_ADMISSION_TRY_PLAN,
     PYJIT_EXT_BINARY_ADMISSION_TRY_PLAN_NULL,
     PYJIT_EXT_BINARY_ADMISSION_PLAN_SUCCESS,
@@ -396,10 +397,6 @@ struct _PyJitExtSiteState {
     int64_t element_count_min;
     int64_t element_count_max;
     int64_t element_count_last;
-    uint16_t fused_site_count;
-    uint16_t fused_hit_count;
-    uint16_t fused_miss_count;
-    const char *fused_pattern;
     uint16_t region_site_count;
     uint16_t region_hit_count;
     uint16_t region_fallback_count;
@@ -416,6 +413,13 @@ struct _PyJitExtSiteState {
     uint16_t region_specialize_decline_count;
     uint16_t region_negative_count;
     uint16_t region_saturated_count;
+    uint64_t total_hit_count;
+    uint64_t region_retry_at_hit;
+    uint32_t region_disable_backoff;
+    uint32_t region_rearm_count;
+    uint64_t region_property_token;
+    uint64_t region_disabled_property_token;
+    uint8_t region_disable_sticky;
     const char *region_lowering_name;
     const char *region_guard_fail_reason;
     /* Provider-owned cache whose lifetime follows the bytecode site rather

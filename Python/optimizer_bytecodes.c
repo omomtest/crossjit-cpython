@@ -342,24 +342,13 @@ dummy_func(void) {
                             PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED;
                         if (site->disable_reason != NULL) {
                             if (strcmp(site->disable_reason,
-                                       "numpy_shape_mismatch") == 0) {
-                                disabled_reason =
-                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_NUMPY_SHAPE_MISMATCH;
-                            }
-                            else if (strcmp(site->disable_reason,
-                                            "numpy_scalar_array_not_c_contiguous") == 0) {
-                                disabled_reason =
-                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_NUMPY_SCALAR_ARRAY_NOT_C_CONTIGUOUS;
-                            }
-                            else if (strcmp(site->disable_reason,
-                                            "miss_threshold") == 0) {
+                                       "miss_threshold") == 0) {
                                 disabled_reason =
                                     PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_MISS_THRESHOLD;
                             }
-                            else if (strcmp(site->disable_reason,
-                                            "strided_min_elements") == 0) {
+                            else {
                                 disabled_reason =
-                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_STRIDED_MIN_ELEMENTS;
+                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_PROVIDER_POLICY;
                             }
                         }
                         _PyJit_RecordExtBinaryAdmission(

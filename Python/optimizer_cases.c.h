@@ -980,50 +980,19 @@
             break;
         }
 
-        case _EXT_FUSED_BINARY2_EXEC: {
-            JitOptRef res;
-            JitOptRef l;
-            JitOptRef r;
-            JitOptRef o;
-            res = sym_new_not_null(ctx);
-            l = sym_new_not_null(ctx);
-            r = sym_new_not_null(ctx);
-            o = sym_new_not_null(ctx);
-            CHECK_STACK_BOUNDS(1);
-            stack_pointer[-3] = res;
-            stack_pointer[-2] = l;
-            stack_pointer[-1] = r;
-            stack_pointer[0] = o;
-            stack_pointer += 1;
-            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-            break;
-        }
-
-        case _EXT_FUSED_BINARY2_RIGHT_EXEC: {
-            JitOptRef res;
-            JitOptRef o;
-            JitOptRef l;
-            JitOptRef r;
-            res = sym_new_not_null(ctx);
-            o = sym_new_not_null(ctx);
-            l = sym_new_not_null(ctx);
-            r = sym_new_not_null(ctx);
-            CHECK_STACK_BOUNDS(1);
-            stack_pointer[-3] = res;
-            stack_pointer[-2] = o;
-            stack_pointer[-1] = l;
-            stack_pointer[0] = r;
-            stack_pointer += 1;
-            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-            break;
-        }
-
         case _EXT_REGION_EXEC: {
             JitOptRef res;
             res = sym_new_not_null(ctx);
             CHECK_STACK_BOUNDS(1 - oparg);
             stack_pointer[-oparg] = res;
             stack_pointer += 1 - oparg;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
+        case _EXT_REGION_STORE: {
+            CHECK_STACK_BOUNDS(-3 - oparg);
+            stack_pointer += -3 - oparg;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
             break;
         }
@@ -5815,24 +5784,13 @@
                             PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED;
                             if (site->disable_reason != NULL) {
                                 if (strcmp(site->disable_reason,
-                                       "numpy_shape_mismatch") == 0) {
-                                    disabled_reason =
-                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_NUMPY_SHAPE_MISMATCH;
-                                }
-                                else if (strcmp(site->disable_reason,
-                                         "numpy_scalar_array_not_c_contiguous") == 0) {
-                                    disabled_reason =
-                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_NUMPY_SCALAR_ARRAY_NOT_C_CONTIGUOUS;
-                                }
-                                else if (strcmp(site->disable_reason,
-                                         "miss_threshold") == 0) {
+                                       "miss_threshold") == 0) {
                                     disabled_reason =
                                     PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_MISS_THRESHOLD;
                                 }
-                                else if (strcmp(site->disable_reason,
-                                         "strided_min_elements") == 0) {
+                                else {
                                     disabled_reason =
-                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_STRIDED_MIN_ELEMENTS;
+                                    PYJIT_EXT_BINARY_ADMISSION_SITE_DISABLED_PROVIDER_POLICY;
                                 }
                             }
                             _PyJit_RecordExtBinaryAdmission(

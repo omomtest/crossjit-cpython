@@ -43,6 +43,8 @@ Program Execution
 
 - [The JIT](jit.md)
 
+- [CrossJIT external C API](crossjit-c-api.md)
+
 - [Garbage Collector Design](garbage_collector.md)
 
 - [Exception Handling](exception_handling.md)

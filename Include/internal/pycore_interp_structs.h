@@ -938,6 +938,7 @@ struct _is {
     PyObject *jit_callable_provider_callables[PYJIT_EXT_CALLABLE_PROVIDER_CACHE_MAX];
     uint8_t jit_callable_provider_cache_count;
     uint8_t jit_callable_provider_cache_overflow;
+    uint8_t jit_ext_entry_probes_enabled;
     PyMutex jit_callable_provider_registry_mutex;
     PyObject *jit_ext_site_registry;
     PyMutex jit_ext_site_registry_mutex;
