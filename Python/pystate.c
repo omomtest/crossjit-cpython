@@ -8,6 +8,7 @@
 #include "pycore_ceval.h"         // _PyEval_AcquireLock()
 #include "pycore_codecs.h"        // _PyCodec_Fini()
 #include "pycore_critical_section.h" // _PyCriticalSection_Resume()
+#include "pycore_crossjit.h"
 #include "pycore_dtoa.h"          // _dtoa_state_INIT()
 #include "pycore_freelist.h"      // _PyObject_ClearFreeLists()
 #include "pycore_initconfig.h"    // _PyStatus_OK()
@@ -591,6 +592,9 @@ init_interpreter(PyInterpreterState *interp,
         interp->monitoring_tool_versions[t] = 0;
     }
     interp->_code_object_generation = 0;
+    interp->crossjit_provider_registry_mutex = (PyMutex){0};
+    interp->crossjit_provider_registry = NULL;
+    interp->crossjit_host_proof_cache = NULL;
     interp->jit = false;
     interp->compiling = false;
     interp->executor_blooms = NULL;
@@ -857,6 +861,7 @@ interpreter_clear(PyInterpreterState *interp, PyThreadState *tstate)
 
     Py_CLEAR(interp->sysdict_copy);
     Py_CLEAR(interp->builtins_copy);
+    _PyCrossJit_InterpreterClear(interp);
     Py_CLEAR(interp->dict);
 #ifdef HAVE_FORK
     Py_CLEAR(interp->before_forkers);

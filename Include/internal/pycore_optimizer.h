@@ -14,6 +14,7 @@ extern "C" {
 #include "pycore_uop_ids.h"
 #include "pycore_stackref.h"      // _PyStackRef
 #include "pycore_optimizer_types.h"
+#include "pycore_crossjit.h"
 #include <stdbool.h>
 
 /* Fitness controls how long a trace can grow.
@@ -95,6 +96,8 @@ typedef struct _JitOptContext {
     JitOptRef stack_array[ABSTRACT_INTERP_STACK_SIZE];
     _PyJitUopBuffer out_buffer;
     _PyBloomFilter *dependencies;
+    /* Allocated lazily after an exact CrossJIT registry hit. */
+    CrossJitAnalysisState *crossjit;
 } JitOptContext;
 
 
@@ -136,7 +139,7 @@ typedef struct _PyJitTracerInitialState {
     _Py_CODEUNIT *jump_backward_instr;
 } _PyJitTracerInitialState;
 
-#define MAX_RECORDED_VALUES 3
+#define MAX_RECORDED_VALUES 10
 typedef struct _PyJitTracerPreviousState {
     int instr_oparg;
     int instr_stacklevel;
@@ -197,6 +200,10 @@ typedef struct _PyExecutorObject {
     _PyVMData vm_data; /* Used by the VM, but opaque to the optimizer */
     uint32_t exit_count;
     uint32_t code_size;
+    /* Provider plans remain opaque to generic executor code.  The executor
+     * owns this table and releases every contained plan during finalization. */
+    uint16_t crossjit_plan_count;
+    CrossJitExecutorPlan *crossjit_plans;
     size_t jit_size;
     void *jit_code;
     _PyJitCodeRegistration *jit_registration;
@@ -477,6 +484,39 @@ extern JitOptRef *_Py_uop_sym_set_stack_depth(JitOptContext *ctx, int stack_dept
 
 extern void _Py_uop_abstractcontext_init(JitOptContext *ctx, _PyBloomFilter *dependencies);
 extern void _Py_uop_abstractcontext_fini(JitOptContext *ctx);
+
+/* Host bridge used by generated abstract-interpreter cases.  It creates
+ * opaque value/node handles and invokes only a prefiltered exact-type match. */
+typedef struct {
+    const PyJitProviderSpec *provider;
+    PyJitRecognition recognition;
+    PyJitSemanticSummary summary;
+} CrossJitRecognition;
+extern int _PyCrossJit_RecognizeBinary(
+    JitOptContext *ctx, int operation, JitOptRef left, JitOptRef right,
+    CrossJitRecognition *recognition);
+extern int _PyCrossJit_BindBinary(
+    JitOptContext *ctx, int operation, JitOptRef left, JitOptRef right,
+    JitOptRef result, uint32_t uop_index,
+    const CrossJitRecognition *recognition);
+extern void _PyCrossJit_RecordSuppressedSpeculation(uint32_t count);
+extern int _PyCrossJit_AnalyzeUnary(
+    JitOptContext *ctx, int operation, JitOptRef operand,
+    JitOptRef result, uint32_t uop_index);
+extern int _PyCrossJit_AnalyzeCompare(
+    JitOptContext *ctx, int operation, JitOptRef left, JitOptRef right,
+    JitOptRef result, uint32_t uop_index);
+extern int _PyCrossJit_AnalyzeCall(
+    JitOptContext *ctx, JitOptRef callable, JitOptRef *args,
+    int arg_count, JitOptRef result, uint32_t uop_index);
+int _PyCrossJit_AnalyzeCallKw(JitOptContext *ctx, JitOptRef callable,
+    JitOptRef *args, int arg_count, JitOptRef keywords, JitOptRef result,
+    uint32_t uop_index);
+int _PyCrossJit_ShouldObserveCallSite(PyObject *callable, PyObject *receiver);
+int _PyCrossJit_AnalyzeMethodCall(JitOptContext *ctx, JitOptRef callable, JitOptRef self,
+    JitOptRef *args, int count, PyObject *keywords, JitOptRef result, uint32_t index);
+extern int _PyCrossJit_ShouldObserveCompare(
+    PyObject *left, PyObject *right, int operation);
 
 extern _Py_UOpsAbstractFrame *_Py_uop_frame_new(
     JitOptContext *ctx,

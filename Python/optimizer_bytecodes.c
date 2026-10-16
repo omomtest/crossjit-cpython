@@ -281,6 +281,12 @@ dummy_func(void) {
         l = lhs;
         r = rhs;
         REPLACE_OPCODE_IF_EVALUATES_PURE(lhs, rhs, res);
+        CrossJitRecognition crossjit_recognition;
+        int crossjit_recognized = _PyCrossJit_RecognizeBinary(
+            ctx, oparg, lhs, rhs, &crossjit_recognition);
+        if (crossjit_recognized < 0) {
+            goto error;
+        }
         bool lhs_int = sym_matches_type(lhs, &PyLong_Type);
         bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
         bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
@@ -291,15 +297,27 @@ dummy_func(void) {
                              || oparg == NB_INPLACE_REMAINDER);
         int emit_op = _BINARY_OP;
         // Promote probable-float operands to known floats via speculative
-        // guards. _RECORD_TOS_TYPE / _RECORD_NOS_TYPE in the BINARY_OP macro
-        // record the observed operand type during tracing, which
+        // guards. _RECORD_TOS / _RECORD_NOS in the BINARY_OP macro record
+        // the observed operands during tracing, from which
         // sym_get_probable_type reads here. Applied only to ops where
         // narrowing unlocks a meaningful downstream win:
         //   - NB_TRUE_DIVIDE: enables the specialized float path below.
         //   - NB_REMAINDER: lets the float result type propagate.
         // NB_POWER is excluded: speculative guards there regressed
         // test_power_type_depends_on_input_values (GH-127844).
-        if (is_truediv || is_remainder) {
+        if (crossjit_recognized && (is_truediv || is_remainder)) {
+            _PyCrossJit_RecordSuppressedSpeculation(
+                (!sym_has_type(rhs) &&
+                 sym_get_probable_type(rhs) == &PyFloat_Type) +
+                (!sym_has_type(lhs) &&
+                 sym_get_probable_type(lhs) == &PyFloat_Type));
+        }
+        /* Speculative narrowing is optional scalar specialization, not
+         * Python operation semantics. For a recognized external operation
+         * retain the generic fallback without creating either the guard or
+         * its symbolic narrowing. Existing proven facts/guards stay intact;
+         * Provider recognition alone never authorizes an executable region. */
+        if (!crossjit_recognized && (is_truediv || is_remainder)) {
             if (!sym_has_type(rhs)
                     && sym_get_probable_type(rhs) == &PyFloat_Type) {
                 ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
@@ -378,6 +396,14 @@ dummy_func(void) {
         }
         else {
             res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+        }
+        /* Bind the result only after the ordinary transfer. Recognition used
+         * opaque operand identities before optional scalar specialization. */
+        uint32_t crossjit_uop_index = (uint32_t)uop_buffer_length(&ctx->out_buffer);
+        if (crossjit_recognized && _PyCrossJit_BindBinary(
+                ctx, oparg, lhs, rhs, res, crossjit_uop_index,
+                &crossjit_recognition) < 0) {
+            goto error;
         }
         ADD_OP(emit_op, oparg, 0);
     }
@@ -746,6 +772,18 @@ dummy_func(void) {
                 res = sym_new_not_null(ctx);
             }
         }
+        /* Let a prefiltered provider refine the result after CPython's own
+         * transfer function, while keeping uop details Host-private. */
+        uint32_t crossjit_uop_index =
+            (uint32_t)uop_buffer_length(&ctx->out_buffer);
+        int crossjit_status = _PyCrossJit_AnalyzeUnary(
+            ctx, PYJIT_UNARY_NEGATIVE, value, res, crossjit_uop_index);
+        if (crossjit_status < 0) {
+            goto error;
+        }
+        if (crossjit_status > 0) {
+            ADD_OP(_UNARY_NEGATIVE, 0, 0);
+        }
     }
 
     op(_UNARY_INVERT, (value -- res, v)) {
@@ -762,6 +800,22 @@ dummy_func(void) {
         }
     }
 
+    op(_CALL_NON_PY_GENERAL, (callable, self_or_null, args[oparg] -- res)) {
+        res = sym_new_not_null(ctx);
+        if (oparg <= PYJIT_OPERATION_MAX_OPERANDS && sym_is_null(self_or_null)) {
+            uint32_t crossjit_uop_index =
+                (uint32_t)uop_buffer_length(&ctx->out_buffer);
+            int crossjit_status = _PyCrossJit_AnalyzeCall(
+                ctx, callable, args, oparg, res, crossjit_uop_index);
+            if (crossjit_status < 0) {
+                goto error;
+            }
+            if (crossjit_status > 0) {
+                ADD_OP(_CALL_NON_PY_GENERAL, oparg, 0);
+            }
+        }
+    }
+
     op(_COMPARE_OP, (left, right -- res)) {
         // Comparison between bytes and str or int is not impacted by this optimization as bytes
         // is not a safe type (due to its ability to raise a warning during comparisons).
@@ -771,6 +825,16 @@ dummy_func(void) {
         }
         else {
             res = _Py_uop_sym_new_not_null(ctx);
+        }
+        /* Rich comparison uses the public Py_LT..Py_GE operation numbers;
+         * providers may model the result even when no execution lowering is
+         * available for this stack shape. */
+        uint32_t crossjit_uop_index =
+            (uint32_t)uop_buffer_length(&ctx->out_buffer);
+        if (_PyCrossJit_AnalyzeCompare(
+                ctx, oparg >> 5, left, right, res,
+                crossjit_uop_index) < 0) {
+            goto error;
         }
     }
 
@@ -1741,7 +1805,29 @@ dummy_func(void) {
     }
 
     op(_CALL_BUILTIN_FAST_WITH_KEYWORDS, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
+        JitOptRef original_callable=callable;
         callable = sym_new_not_null(ctx);
+        if (oparg<=PYJIT_OPERATION_MAX_OPERANDS && sym_is_null(self_or_null)) {
+            uint32_t index=(uint32_t)uop_buffer_length(&ctx->out_buffer);
+            int status=_PyCrossJit_AnalyzeCall(ctx,original_callable,args,oparg,callable,index);
+            if (status<0) { goto error; }
+            if (status>0) { ADD_OP(_CALL_BUILTIN_FAST_WITH_KEYWORDS,oparg,0); }
+        }
+    }
+
+    op(_CALL_KW_NON_PY, (callable, self_or_null, args[oparg], kwnames -- res)) {
+        res=sym_new_not_null(ctx);
+        if (oparg<=PYJIT_OPERATION_MAX_OPERANDS) {
+            uint32_t index=(uint32_t)uop_buffer_length(&ctx->out_buffer);
+            int status=0;
+            if (sym_is_null(self_or_null)) { status=_PyCrossJit_AnalyzeCallKw(ctx,callable,args,oparg,kwnames,res,index); }
+            else {
+                PyObject *names=_Py_uop_sym_get_probable_value(kwnames);
+                if (names) { status=_PyCrossJit_AnalyzeMethodCall(ctx,callable,self_or_null,args,oparg,names,res,index); }
+            }
+            if (status<0) { goto error; }
+            if (status>0) { ADD_OP(_CALL_KW_NON_PY,oparg,0); }
+        }
     }
 
     op(_CALL_BUILTIN_O, (callable, self_or_null, args[oparg] -- res, c, s)) {
@@ -1878,14 +1964,19 @@ dummy_func(void) {
     }
 
     op(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
-        PyObject *callable_o = sym_get_const(ctx, callable);
-        if (callable_o && Py_IS_TYPE(callable_o, &PyMethodDescr_Type)
-            && sym_is_not_null(self_or_null)) {
-            PyMethodDescrObject *method = (PyMethodDescrObject *)callable_o;
-            PyCFunction cfunc = method->d_method->ml_meth;
-            ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS_INLINE, oparg, (uintptr_t)cfunc);
+        JitOptRef original_callable=callable;
+        callable=sym_new_not_null(ctx);
+        uint32_t index=(uint32_t)uop_buffer_length(&ctx->out_buffer);
+        int status=_PyCrossJit_AnalyzeMethodCall(ctx,original_callable,self_or_null,args,oparg,NULL,callable,index);
+        if (status<0) { goto error; }
+        if (status>0) { ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS,oparg,0); }
+        else {
+            PyObject *callable_o=sym_get_const(ctx,original_callable);
+            if (callable_o && Py_IS_TYPE(callable_o,&PyMethodDescr_Type) && sym_is_not_null(self_or_null)) {
+                PyMethodDescrObject *method=(PyMethodDescrObject *)callable_o;
+                ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS_INLINE,oparg,(uintptr_t)method->d_method->ml_meth);
+            }
         }
-        callable = sym_new_not_null(ctx);
     }
 
     op(_CALL_METHOD_DESCRIPTOR_FAST, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
@@ -2618,6 +2709,81 @@ dummy_func(void) {
 
     op(_RECORD_CALLABLE, (func, self, args[oparg] -- func, self, args[oparg])) {
         sym_set_recorded_value(func, (PyObject *)this_instr->operand0);
+    }
+
+    op(_RECORD_CJSELF, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (this_instr->operand0) { sym_set_recorded_value(self,(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWSELF, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (this_instr->operand0) { sym_set_recorded_value(self,(PyObject *)this_instr->operand0); }
+    }
+
+    op(_RECORD_CJARG0, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg >= 1 && this_instr->operand0 != 0) {
+            sym_set_recorded_value(args[0], (PyObject *)this_instr->operand0);
+        }
+    }
+
+    op(_RECORD_CJARG1, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg >= 2 && this_instr->operand0 != 0) {
+            sym_set_recorded_value(args[1], (PyObject *)this_instr->operand0);
+        }
+    }
+
+    op(_RECORD_CJKWARG0, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>=1 && this_instr->operand0) { sym_set_recorded_value(args[0],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWARG1, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>=2 && this_instr->operand0) { sym_set_recorded_value(args[1],(PyObject *)this_instr->operand0); }
+    }
+
+    op(_RECORD_CJARG2, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg>2 && this_instr->operand0) { sym_set_recorded_value(args[2],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWARG2, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>2 && this_instr->operand0) { sym_set_recorded_value(args[2],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJARG3, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg>3 && this_instr->operand0) { sym_set_recorded_value(args[3],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWARG3, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>3 && this_instr->operand0) { sym_set_recorded_value(args[3],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJARG4, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg>4 && this_instr->operand0) { sym_set_recorded_value(args[4],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWARG4, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>4 && this_instr->operand0) { sym_set_recorded_value(args[4],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJARG5, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg>5 && this_instr->operand0) { sym_set_recorded_value(args[5],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWARG5, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>5 && this_instr->operand0) { sym_set_recorded_value(args[5],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJARG6, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg>6 && this_instr->operand0) { sym_set_recorded_value(args[6],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWARG6, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>6 && this_instr->operand0) { sym_set_recorded_value(args[6],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJARG7, (func, self, args[oparg] -- func, self, args[oparg])) {
+        if (oparg>7 && this_instr->operand0) { sym_set_recorded_value(args[7],(PyObject *)this_instr->operand0); }
+    }
+    op(_RECORD_CJKWARG7, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+        if (oparg>7 && this_instr->operand0) { sym_set_recorded_value(args[7],(PyObject *)this_instr->operand0); }
+    }
+
+    op(_RECORD_CJRIGHT, (left, right -- left, right)) {
+        if (this_instr->operand0 != 0) {
+            sym_set_recorded_value(right, (PyObject *)this_instr->operand0);
+        }
+    }
+
+    op(_RECORD_CJLEFT, (left, right -- left, right)) {
+        if (this_instr->operand0 != 0) {
+            sym_set_recorded_value(left, (PyObject *)this_instr->operand0);
+        }
     }
 
     op(_RECORD_CALLABLE_KW, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {

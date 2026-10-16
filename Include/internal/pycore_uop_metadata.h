@@ -378,6 +378,8 @@ const uint32_t _PyUop_Flags[MAX_UOP_ID+1] = {
     [_COPY_3] = HAS_PURE_FLAG,
     [_COPY] = HAS_ARG_FLAG | HAS_PURE_FLAG,
     [_BINARY_OP] = HAS_ARG_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
+    [_EXT_GUARD] = HAS_ARG_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
+    [_EXT_REGION_EXEC] = HAS_ARG_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ERROR_NO_POP_FLAG | HAS_ESCAPES_FLAG,
     [_SWAP_2] = HAS_PURE_FLAG,
     [_SWAP_3] = HAS_PURE_FLAG,
     [_SWAP] = HAS_ARG_FLAG | HAS_PURE_FLAG,
@@ -431,6 +433,26 @@ const uint32_t _PyUop_Flags[MAX_UOP_ID+1] = {
     [_RECORD_3OS_GEN_FUNC] = HAS_RECORDS_VALUE_FLAG,
     [_RECORD_4OS] = HAS_RECORDS_VALUE_FLAG,
     [_RECORD_CALLABLE] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJSELF] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWSELF] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG0] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG1] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG0] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG1] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG2] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG2] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG3] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG3] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG4] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG4] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG5] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG5] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG6] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG6] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJARG7] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJKWARG7] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJRIGHT] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
+    [_RECORD_CJLEFT] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
     [_RECORD_CALLABLE_KW] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
     [_RECORD_BOUND_METHOD] = HAS_ARG_FLAG | HAS_RECORDS_VALUE_FLAG,
     [_RECORD_CODE] = HAS_RECORDS_VALUE_FLAG,
@@ -3536,6 +3558,24 @@ const _PyUopCachingInfo _PyUop_Caching[MAX_UOP_ID+1] = {
             { -1, -1, -1 },
         },
     },
+    [_EXT_GUARD] = {
+        .best = { 0, 0, 0, 0 },
+        .entries = {
+            { 0, 0, _EXT_GUARD_r00 },
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+        },
+    },
+    [_EXT_REGION_EXEC] = {
+        .best = { 0, 0, 0, 0 },
+        .entries = {
+            { 1, 0, _EXT_REGION_EXEC_r01 },
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+            { -1, -1, -1 },
+        },
+    },
     [_SWAP_2] = {
         .best = { 0, 1, 2, 3 },
         .entries = {
@@ -4704,6 +4744,8 @@ const uint16_t _PyUop_Uncached[MAX_UOP_REGS_ID+1] = {
     [_COPY_3_r33] = _COPY_3,
     [_COPY_r01] = _COPY,
     [_BINARY_OP_r23] = _BINARY_OP,
+    [_EXT_GUARD_r00] = _EXT_GUARD,
+    [_EXT_REGION_EXEC_r01] = _EXT_REGION_EXEC,
     [_SWAP_2_r02] = _SWAP_2,
     [_SWAP_2_r12] = _SWAP_2,
     [_SWAP_2_r22] = _SWAP_2,
@@ -5244,6 +5286,10 @@ const char *const _PyOpcode_uop_name[MAX_UOP_REGS_ID+1] = {
     [_EXPAND_METHOD_r00] = "_EXPAND_METHOD_r00",
     [_EXPAND_METHOD_KW] = "_EXPAND_METHOD_KW",
     [_EXPAND_METHOD_KW_r11] = "_EXPAND_METHOD_KW_r11",
+    [_EXT_GUARD] = "_EXT_GUARD",
+    [_EXT_GUARD_r00] = "_EXT_GUARD_r00",
+    [_EXT_REGION_EXEC] = "_EXT_REGION_EXEC",
+    [_EXT_REGION_EXEC_r01] = "_EXT_REGION_EXEC_r01",
     [_FATAL_ERROR] = "_FATAL_ERROR",
     [_FATAL_ERROR_r00] = "_FATAL_ERROR_r00",
     [_FATAL_ERROR_r11] = "_FATAL_ERROR_r11",
@@ -6005,6 +6051,26 @@ const char *const _PyOpcode_uop_name[MAX_UOP_REGS_ID+1] = {
     [_RECORD_BOUND_METHOD] = "_RECORD_BOUND_METHOD",
     [_RECORD_CALLABLE] = "_RECORD_CALLABLE",
     [_RECORD_CALLABLE_KW] = "_RECORD_CALLABLE_KW",
+    [_RECORD_CJARG0] = "_RECORD_CJARG0",
+    [_RECORD_CJARG1] = "_RECORD_CJARG1",
+    [_RECORD_CJARG2] = "_RECORD_CJARG2",
+    [_RECORD_CJARG3] = "_RECORD_CJARG3",
+    [_RECORD_CJARG4] = "_RECORD_CJARG4",
+    [_RECORD_CJARG5] = "_RECORD_CJARG5",
+    [_RECORD_CJARG6] = "_RECORD_CJARG6",
+    [_RECORD_CJARG7] = "_RECORD_CJARG7",
+    [_RECORD_CJKWARG0] = "_RECORD_CJKWARG0",
+    [_RECORD_CJKWARG1] = "_RECORD_CJKWARG1",
+    [_RECORD_CJKWARG2] = "_RECORD_CJKWARG2",
+    [_RECORD_CJKWARG3] = "_RECORD_CJKWARG3",
+    [_RECORD_CJKWARG4] = "_RECORD_CJKWARG4",
+    [_RECORD_CJKWARG5] = "_RECORD_CJKWARG5",
+    [_RECORD_CJKWARG6] = "_RECORD_CJKWARG6",
+    [_RECORD_CJKWARG7] = "_RECORD_CJKWARG7",
+    [_RECORD_CJKWSELF] = "_RECORD_CJKWSELF",
+    [_RECORD_CJLEFT] = "_RECORD_CJLEFT",
+    [_RECORD_CJRIGHT] = "_RECORD_CJRIGHT",
+    [_RECORD_CJSELF] = "_RECORD_CJSELF",
     [_RECORD_CODE] = "_RECORD_CODE",
     [_RECORD_NOS] = "_RECORD_NOS",
     [_RECORD_NOS_GEN_FUNC] = "_RECORD_NOS_GEN_FUNC",
@@ -6910,6 +6976,10 @@ int _PyUop_num_popped(int opcode, int oparg)
             return 0;
         case _BINARY_OP:
             return 2;
+        case _EXT_GUARD:
+            return 0;
+        case _EXT_REGION_EXEC:
+            return oparg;
         case _SWAP_2:
             return 0;
         case _SWAP_3:
@@ -7015,6 +7085,46 @@ int _PyUop_num_popped(int opcode, int oparg)
         case _RECORD_4OS:
             return 0;
         case _RECORD_CALLABLE:
+            return 0;
+        case _RECORD_CJSELF:
+            return 0;
+        case _RECORD_CJKWSELF:
+            return 0;
+        case _RECORD_CJARG0:
+            return 0;
+        case _RECORD_CJARG1:
+            return 0;
+        case _RECORD_CJKWARG0:
+            return 0;
+        case _RECORD_CJKWARG1:
+            return 0;
+        case _RECORD_CJARG2:
+            return 0;
+        case _RECORD_CJKWARG2:
+            return 0;
+        case _RECORD_CJARG3:
+            return 0;
+        case _RECORD_CJKWARG3:
+            return 0;
+        case _RECORD_CJARG4:
+            return 0;
+        case _RECORD_CJKWARG4:
+            return 0;
+        case _RECORD_CJARG5:
+            return 0;
+        case _RECORD_CJKWARG5:
+            return 0;
+        case _RECORD_CJARG6:
+            return 0;
+        case _RECORD_CJKWARG6:
+            return 0;
+        case _RECORD_CJARG7:
+            return 0;
+        case _RECORD_CJKWARG7:
+            return 0;
+        case _RECORD_CJRIGHT:
+            return 0;
+        case _RECORD_CJLEFT:
             return 0;
         case _RECORD_CALLABLE_KW:
             return 0;

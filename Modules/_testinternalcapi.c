@@ -10,6 +10,7 @@
 #undef NDEBUG
 
 #include "Python.h"
+#include "opcode.h"
 #include <string.h>
 #include "pycore_backoff.h"       // JUMP_BACKWARD_INITIAL_VALUE
 #include "pycore_bitutils.h"      // _Py_bswap32()
@@ -18,6 +19,7 @@
 #include "pycore_code.h"          // _PyCode_GetTLBCFast()
 #include "pycore_compile.h"       // _PyCompile_CodeGen()
 #include "pycore_context.h"       // _PyContext_NewHamtForTests()
+#include "pycore_crossjit.h"      // _PyCrossJit_GetStats()
 #include "pycore_dict.h"          // PyDictValues
 #include "pycore_fileutils.h"     // _Py_normpath()
 #include "pycore_flowgraph.h"     // _PyCompile_OptimizeCfg()
@@ -3189,7 +3191,586 @@ test_thread_state_ensure_from_view_interp_switch(PyObject *self, PyObject *unuse
     Py_RETURN_NONE;
 }
 
+/* Exposes per-interpreter CrossJIT counters only to the internal test module. */
+
+/* Minimal non-NumPy Provider used to test the public semantic architecture.
+ * Its private contract tag deliberately does not participate in S_H. */
+typedef struct {
+    int contract_tag;
+    uint8_t node_count;
+    uint8_t input_count;
+    uint8_t left[PYJIT_REGION_MAX_NODES];
+    uint8_t right[PYJIT_REGION_MAX_NODES];
+    uint8_t assumption_count;
+    PyObject *guard_tokens[2];
+    PyJitAssumption assumptions[2];
+    const PyJitValueRef *dependencies[2][1];
+    uint8_t assumption_keys[2];
+} SyntheticCrossJitContract;
+
+struct PyJitGuardPlan {
+    int contract_tag;
+    uint8_t assumption_count;
+    uint8_t input_indices[2];
+    uint64_t semantic_property_mask;
+    PyObject *tokens[2];
+};
+
+struct PyJitExecPlan {
+    int contract_tag;
+    uint8_t node_count;
+    uint8_t input_count;
+    uint8_t left[PYJIT_REGION_MAX_NODES];
+    uint8_t right[PYJIT_REGION_MAX_NODES];
+};
+
+static PyTypeObject *synthetic_crossjit_type;
+static PyJitProviderKey synthetic_crossjit_key;
+static int synthetic_crossjit_semantic_case;
+static int synthetic_crossjit_contract_tag;
+static int synthetic_crossjit_decision = PYJIT_PREPARE_ACCEPT;
+static int synthetic_crossjit_assumption_case;
+static int synthetic_crossjit_lowering_case;
+static int synthetic_crossjit_combined_case;
+static int synthetic_crossjit_max_nodes;
+static uint64_t synthetic_crossjit_projection_index;
+static uint64_t synthetic_crossjit_prepare_called;
+static uint64_t synthetic_crossjit_contract_destroyed;
+static uint64_t synthetic_crossjit_guard_destroyed;
+static uint64_t synthetic_crossjit_exec_destroyed;
+static uint64_t synthetic_crossjit_last_guard_property_mask;
+static uint64_t synthetic_crossjit_last_guard_assumption_count;
+
+static PyJitResult
+synthetic_crossjit_recognize(const PyJitRecognizeRequest *request,
+                             PyJitRecognition *recognition)
+{
+    if (request->kind != PYJIT_OPERATION_BINARY ||
+        request->operation != NB_ADD || request->operand_count != 2) {
+        return PYJIT_RESULT_MISS;
+    }
+    recognition->semantic_id = 1;
+    return PYJIT_RESULT_HIT;
+}
+
+static PyJitResult
+synthetic_crossjit_project(const PyJitRecognizeRequest *request,
+                           const PyJitRecognition *recognition,
+                           PyJitSemanticSummary *summary)
+{
+    (void)request;
+    (void)recognition;
+    uint64_t projection_index = synthetic_crossjit_projection_index++;
+    int aliases = synthetic_crossjit_semantic_case == 2 &&
+                  (projection_index & 1) != 0;
+    int releases_gil = synthetic_crossjit_semantic_case == 3 &&
+                       (projection_index & 1) == 0;
+    *summary = (PyJitSemanticSummary){
+        .struct_size = sizeof(*summary),
+        .mutation = PYJIT_MUTATION_NONE,
+        .result_alias = aliases ? PYJIT_ALIAS_MAY_ALIAS_ARGUMENT :
+                                  PYJIT_ALIAS_FRESH,
+        .materialization = aliases ? PYJIT_MATERIALIZATION_REQUIRED :
+                                     PYJIT_MATERIALIZATION_VIRTUALIZABLE,
+        .replayability = PYJIT_REPLAYABLE,
+        .may_raise = 1,
+        .may_release_gil = (uint8_t)releases_gil,
+        .exact_result_type = synthetic_crossjit_type,
+    };
+    return PYJIT_RESULT_HIT;
+}
+
+static int
+synthetic_crossjit_slot(const PyJitRegionView *region, uint8_t node_index,
+                        const PyJitValueRef *value)
+{
+    uint8_t input_count = PyJit_RegionGetInputCount(region);
+    for (uint8_t i = 0; i < input_count; i++) {
+        const PyJitRegionValue *input = PyJit_RegionGetInput(region, i);
+        if (input != NULL && input->value == value) {
+            return i;
+        }
+    }
+    for (uint8_t i = 0; i < node_index; i++) {
+        const PyJitNodeRef *node = PyJit_RegionGetNode(region, i);
+        if (PyJit_NodeGetResult(node, 0) == value) {
+            return input_count + i;
+        }
+    }
+    return -1;
+}
+
+static PyJitResult
+synthetic_crossjit_prepare(const PyJitRegionView *region,
+                           PyJitPrepareResult *result)
+{
+    synthetic_crossjit_prepare_called++;
+    if (synthetic_crossjit_decision == PYJIT_PREPARE_ERROR) {
+        PyErr_SetString(PyExc_RuntimeError, "synthetic prepare error");
+        return PYJIT_RESULT_ERROR;
+    }
+    uint8_t node_count = PyJit_RegionGetNodeCount(region);
+    if (synthetic_crossjit_decision == PYJIT_PREPARE_UNPROFITABLE &&
+            synthetic_crossjit_max_nodes > 0) {
+        result->decision = node_count > synthetic_crossjit_max_nodes ?
+            PYJIT_PREPARE_UNPROFITABLE : PYJIT_PREPARE_ACCEPT;
+    }
+    else {
+        result->decision = synthetic_crossjit_max_nodes > 0 &&
+                           node_count > synthetic_crossjit_max_nodes ?
+            PYJIT_PREPARE_UNSUPPORTED_NODE :
+            (PyJitPrepareDecision)synthetic_crossjit_decision;
+    }
+    if (result->decision != PYJIT_PREPARE_ACCEPT) {
+        return PYJIT_RESULT_HIT;
+    }
+    SyntheticCrossJitContract *contract = PyMem_Calloc(1, sizeof(*contract));
+    if (contract == NULL) {
+        return PyErr_NoMemory(), PYJIT_RESULT_ERROR;
+    }
+    contract->contract_tag = synthetic_crossjit_contract_tag;
+    contract->node_count = node_count;
+    contract->input_count = PyJit_RegionGetInputCount(region);
+    if (contract->node_count == 0 ||
+        contract->node_count > PYJIT_REGION_MAX_NODES ||
+        contract->input_count == 0) {
+        PyMem_Free(contract);
+        result->decision = PYJIT_PREPARE_UNSUPPORTED_CONTRACT;
+        return PYJIT_RESULT_HIT;
+    }
+    for (uint8_t i = 0; i < contract->node_count; i++) {
+        const PyJitNodeRef *node = PyJit_RegionGetNode(region, i);
+        int left = synthetic_crossjit_slot(
+            region, i, PyJit_NodeGetOperand(node, 0));
+        int right = synthetic_crossjit_slot(
+            region, i, PyJit_NodeGetOperand(node, 1));
+        if (node == NULL || PyJit_NodeGetOperandCount(node) != 2 ||
+            left < 0 || right < 0 || left > UINT8_MAX || right > UINT8_MAX) {
+            PyMem_Free(contract);
+            result->decision = PYJIT_PREPARE_UNSUPPORTED_CONTRACT;
+            return PYJIT_RESULT_HIT;
+        }
+        contract->left[i] = (uint8_t)left;
+        contract->right[i] = (uint8_t)right;
+    }
+    const PyJitRegionValue *inputs[2] = {
+        PyJit_RegionGetInput(region, 0),
+        PyJit_RegionGetInput(region, contract->input_count > 1 ? 1 : 0),
+    };
+    if (inputs[0] == NULL || inputs[1] == NULL) {
+        PyMem_Free(contract);
+        result->decision = PYJIT_PREPARE_UNSUPPORTED_CONTRACT;
+        return PYJIT_RESULT_HIT;
+    }
+    contract->assumption_count = synthetic_crossjit_assumption_case == 4 ? 0 :
+        (synthetic_crossjit_assumption_case == 1 ||
+         synthetic_crossjit_assumption_case == 3 ||
+         synthetic_crossjit_assumption_case == 5 ? 1 : 2);
+    for (uint8_t i = 0; i < contract->assumption_count; i++) {
+        int input_index = synthetic_crossjit_assumption_case == 2 ? i : 0;
+        PyObject *observed = PyJit_ValueGetObservedObject(
+            inputs[input_index]->value);
+        contract->guard_tokens[i] = observed == NULL ? NULL :
+            PyObject_GetAttrString(observed, "token");
+        if (contract->guard_tokens[i] == NULL) {
+            PyErr_Clear();
+            contract->guard_tokens[i] = Py_NewRef(Py_None);
+        }
+        contract->dependencies[i][0] =
+            synthetic_crossjit_assumption_case == 5 ?
+            PyJit_NodeGetResult(PyJit_RegionGetNode(region, 0), 0) :
+            inputs[input_index]->value;
+        contract->assumption_keys[i] =
+            synthetic_crossjit_assumption_case == 2 ? (uint8_t)(i + 1) : 1;
+        uint64_t property_mask = PYJIT_SEMANTIC_PROPERTY_MATERIALIZATION;
+        if (synthetic_crossjit_assumption_case == 0 && i == 1) {
+            property_mask = PYJIT_SEMANTIC_PROPERTY_REPLAYABILITY;
+        }
+        else if (synthetic_crossjit_assumption_case == 3) {
+            property_mask |= PYJIT_SEMANTIC_PROPERTY_REPLAYABILITY;
+        }
+        contract->assumptions[i] = (PyJitAssumption){
+            .kind = 1,
+            .dependencies = contract->dependencies[i],
+            .dependency_count = 1,
+            .semantic_property_mask = property_mask,
+            .canonical_key = &contract->assumption_keys[i],
+            .canonical_key_size = sizeof(contract->assumption_keys[i]),
+            .payload = &contract->guard_tokens[i],
+            .payload_size = sizeof(contract->guard_tokens[i]),
+        };
+    }
+    result->contract = contract;
+    result->contract_size = sizeof(*contract);
+    result->assumptions = contract->assumptions;
+    result->assumption_count = contract->assumption_count;
+    return PYJIT_RESULT_HIT;
+}
+
+static PyJitResult
+synthetic_crossjit_lower_guards(const PyJitSpecializationView *specialization,
+                                PyJitGuardPlan **plan_out)
+{
+    const SyntheticCrossJitContract *contract = specialization->contract;
+    if (contract == NULL || specialization->assumption_count == 0 ||
+        specialization->assumption_count > 2) {
+        return PYJIT_RESULT_MISS;
+    }
+    PyJitGuardPlan *plan = PyMem_Calloc(1, sizeof(*plan));
+    if (plan == NULL) {
+        return PyErr_NoMemory(), PYJIT_RESULT_ERROR;
+    }
+    plan->contract_tag = contract->contract_tag;
+    plan->assumption_count = (uint8_t)specialization->assumption_count;
+    for (uint8_t i = 0; i < plan->assumption_count; i++) {
+        const PyJitAssumption *assumption = &specialization->assumptions[i];
+        if (assumption->dependency_count != 1 ||
+            assumption->payload_size != sizeof(PyObject *) ||
+            assumption->payload == NULL) {
+            PyMem_Free(plan);
+            return PYJIT_RESULT_MISS;
+        }
+        uint8_t input_count = PyJit_RegionGetInputCount(specialization->region);
+        int input_index = -1;
+        for (uint8_t input = 0; input < input_count; input++) {
+            const PyJitRegionValue *value = PyJit_RegionGetInput(
+                specialization->region, input);
+            if (value != NULL && value->value == assumption->dependencies[0]) {
+                input_index = input;
+                break;
+            }
+        }
+        if (input_index < 0) {
+            for (uint8_t done = 0; done < i; done++) {
+                Py_DECREF(plan->tokens[done]);
+            }
+            PyMem_Free(plan);
+            return PYJIT_RESULT_MISS;
+        }
+        PyObject *token = *(PyObject *const *)assumption->payload;
+        plan->input_indices[i] = (uint8_t)input_index;
+        plan->tokens[i] = Py_NewRef(token);
+        plan->semantic_property_mask |= assumption->semantic_property_mask;
+    }
+    synthetic_crossjit_last_guard_assumption_count = plan->assumption_count;
+    synthetic_crossjit_last_guard_property_mask =
+        plan->semantic_property_mask;
+    *plan_out = plan;
+    return PYJIT_RESULT_HIT;
+}
+
+static PyJitResult
+synthetic_crossjit_lower_region(const PyJitSpecializationView *specialization,
+                                PyJitExecPlan **plan_out)
+{
+    if (synthetic_crossjit_lowering_case == 1) {
+        return PYJIT_RESULT_MISS;
+    }
+    const SyntheticCrossJitContract *contract = specialization->contract;
+    if (contract == NULL) {
+        return PYJIT_RESULT_MISS;
+    }
+    PyJitExecPlan *plan = PyMem_Calloc(1, sizeof(*plan));
+    if (plan == NULL) {
+        return PyErr_NoMemory(), PYJIT_RESULT_ERROR;
+    }
+    plan->contract_tag = contract->contract_tag;
+    plan->node_count = contract->node_count;
+    plan->input_count = contract->input_count;
+    memcpy(plan->left, contract->left, sizeof(plan->left));
+    memcpy(plan->right, contract->right, sizeof(plan->right));
+    *plan_out = plan;
+    return PYJIT_RESULT_HIT;
+}
+
+static int
+synthetic_crossjit_truth_attr(PyObject *object, const char *name)
+{
+    PyObject *value = PyObject_GetAttrString(object, name);
+    if (value == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    int truth = PyObject_IsTrue(value);
+    Py_DECREF(value);
+    return truth;
+}
+
+static PyJitResult
+synthetic_crossjit_run_guards(PyJitGuardPlan *plan,
+                              PyObject *const *inputs,
+                              Py_ssize_t input_count)
+{
+    for (uint8_t i = 0; i < plan->assumption_count; i++) {
+        if (plan->input_indices[i] >= input_count) {
+            return PYJIT_RESULT_MISS;
+        }
+        PyObject *token = PyObject_GetAttrString(
+            inputs[plan->input_indices[i]], "token");
+        if (token == NULL) {
+            PyErr_Clear();
+            if (plan->tokens[i] != Py_None) {
+                return PYJIT_RESULT_MISS;
+            }
+            continue;
+        }
+        int equal = PyObject_RichCompareBool(token, plan->tokens[i], Py_EQ);
+        Py_DECREF(token);
+        if (equal < 0) {
+            return PYJIT_RESULT_ERROR;
+        }
+        if (!equal) {
+            return PYJIT_RESULT_MISS;
+        }
+    }
+    return PYJIT_RESULT_HIT;
+}
+
+static PyJitResult
+synthetic_crossjit_run_region(PyJitExecPlan *plan,
+                              PyObject *const *inputs,
+                              Py_ssize_t input_count, PyObject **result)
+{
+    if (input_count != plan->input_count) {
+        return PYJIT_RESULT_MISS;
+    }
+    int error = synthetic_crossjit_truth_attr(inputs[0], "crossjit_error");
+    if (error < 0) {
+        return PYJIT_RESULT_ERROR;
+    }
+    if (error) {
+        PyErr_SetString(PyExc_RuntimeError, "synthetic execution error");
+        return PYJIT_RESULT_ERROR;
+    }
+    int miss = synthetic_crossjit_truth_attr(inputs[0], "crossjit_miss");
+    if (miss < 0) {
+        return PYJIT_RESULT_ERROR;
+    }
+    if (miss) {
+        return PYJIT_RESULT_MISS;
+    }
+    PyObject *slots[PYJIT_REGION_MAX_LIVE_INS + PYJIT_REGION_MAX_NODES] = {0};
+    for (uint8_t i = 0; i < plan->input_count; i++) {
+        slots[i] = inputs[i];
+    }
+    for (uint8_t i = 0; i < plan->node_count; i++) {
+        slots[plan->input_count + i] = PyNumber_Add(
+            slots[plan->left[i]], slots[plan->right[i]]);
+        if (slots[plan->input_count + i] == NULL) {
+            for (uint8_t done = 0; done < i; done++) {
+                Py_DECREF(slots[plan->input_count + done]);
+            }
+            return PYJIT_RESULT_ERROR;
+        }
+    }
+    *result = slots[plan->input_count + plan->node_count - 1];
+    for (uint8_t i = 0; i + 1 < plan->node_count; i++) {
+        Py_DECREF(slots[plan->input_count + i]);
+    }
+    return PYJIT_RESULT_HIT;
+}
+
+static PyJitResult
+synthetic_crossjit_run_guarded_region(PyJitGuardPlan *guards, PyJitExecPlan *plan,
+                                     PyObject *const *inputs, Py_ssize_t count,
+                                     PyJitResult *guard_status, PyObject **result)
+{
+    if (synthetic_crossjit_combined_case == 2) {
+        *guard_status = PYJIT_RESULT_MISS;
+        *result = PyLong_FromLong(42);
+        return PYJIT_RESULT_HIT;
+    }
+    if (synthetic_crossjit_combined_case == 3) {
+        *guard_status = (PyJitResult)99;
+        return PYJIT_RESULT_MISS;
+    }
+    *guard_status = synthetic_crossjit_run_guards(guards, inputs, count);
+    if (*guard_status != PYJIT_RESULT_HIT) {
+        return *guard_status;
+    }
+    return synthetic_crossjit_run_region(plan, inputs, count, result);
+}
+
+static void
+synthetic_crossjit_destroy_contract(void *opaque)
+{
+    SyntheticCrossJitContract *contract = opaque;
+    for (uint8_t i = 0; i < contract->assumption_count; i++) {
+        Py_XDECREF(contract->guard_tokens[i]);
+    }
+    PyMem_Free(contract);
+    synthetic_crossjit_contract_destroyed++;
+}
+
+static void
+synthetic_crossjit_destroy_guard(PyJitGuardPlan *plan)
+{
+    for (uint8_t i = 0; i < plan->assumption_count; i++) {
+        Py_XDECREF(plan->tokens[i]);
+    }
+    PyMem_Free(plan);
+    synthetic_crossjit_guard_destroyed++;
+}
+
+static void
+synthetic_crossjit_destroy_exec(PyJitExecPlan *plan)
+{
+    PyMem_Free(plan);
+    synthetic_crossjit_exec_destroyed++;
+}
+
+static PyJitProviderSpec synthetic_crossjit_provider = {
+    .abi_version = PYJIT_PROVIDER_ABI_VERSION,
+    .struct_size = sizeof(PyJitProviderSpec),
+    .name = "_testinternalcapi.synthetic",
+    .keys = &synthetic_crossjit_key,
+    .key_count = 1,
+    .recognize = synthetic_crossjit_recognize,
+    .project_semantics = synthetic_crossjit_project,
+    .prepare_region = synthetic_crossjit_prepare,
+    .lower_guards = synthetic_crossjit_lower_guards,
+    .lower_region = synthetic_crossjit_lower_region,
+    .run_guards = synthetic_crossjit_run_guards,
+    .run_region = synthetic_crossjit_run_region,
+    .destroy_contract = synthetic_crossjit_destroy_contract,
+    .destroy_guard_plan = synthetic_crossjit_destroy_guard,
+    .destroy_exec_plan = synthetic_crossjit_destroy_exec,
+};
+
+static PyObject *
+crossjit_synthetic_register(PyObject *Py_UNUSED(module), PyObject *type)
+{
+    if (!PyType_Check(type)) {
+        return PyErr_Format(PyExc_TypeError, "expected a type");
+    }
+    if (synthetic_crossjit_type != NULL) {
+        if (PyJit_UnregisterProvider(&synthetic_crossjit_provider) < 0) {
+            return NULL;
+        }
+        Py_CLEAR(synthetic_crossjit_type);
+    }
+    synthetic_crossjit_type = (PyTypeObject *)Py_NewRef(type);
+    synthetic_crossjit_key = (PyJitProviderKey){
+        PYJIT_KEY_BINARY, NB_ADD, synthetic_crossjit_type,
+        synthetic_crossjit_type, NULL
+    };
+    if (PyJit_RegisterProvider(&synthetic_crossjit_provider) < 0) {
+        Py_CLEAR(synthetic_crossjit_type);
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+crossjit_synthetic_unregister(PyObject *Py_UNUSED(module),
+                              PyObject *Py_UNUSED(ignored))
+{
+    if (synthetic_crossjit_type != NULL) {
+        if (PyJit_UnregisterProvider(&synthetic_crossjit_provider) < 0) {
+            return NULL;
+        }
+        Py_CLEAR(synthetic_crossjit_type);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+crossjit_synthetic_configure(PyObject *Py_UNUSED(module), PyObject *args)
+{
+    synthetic_crossjit_assumption_case = 0;
+    synthetic_crossjit_lowering_case = 0;
+    synthetic_crossjit_max_nodes = 0;
+    synthetic_crossjit_combined_case = 0;
+    int single_nodes = 0;
+    if (!PyArg_ParseTuple(args, "iii|iiiii:crossjit_synthetic_configure",
+                          &synthetic_crossjit_semantic_case,
+                          &synthetic_crossjit_contract_tag,
+                          &synthetic_crossjit_decision,
+                          &synthetic_crossjit_assumption_case,
+                          &synthetic_crossjit_lowering_case,
+                          &synthetic_crossjit_max_nodes,
+                          &synthetic_crossjit_combined_case,
+                          &single_nodes)) {
+        return NULL;
+    }
+    if (synthetic_crossjit_assumption_case < 0 ||
+        synthetic_crossjit_assumption_case > 5) {
+        return PyErr_Format(PyExc_ValueError,
+                            "invalid synthetic assumption case");
+    }
+    if (synthetic_crossjit_lowering_case < 0 ||
+        synthetic_crossjit_lowering_case > 1 ||
+        synthetic_crossjit_max_nodes < 0 ||
+        (unsigned int)synthetic_crossjit_max_nodes >
+            PYJIT_REGION_MAX_NODES) {
+        return PyErr_Format(PyExc_ValueError,
+                            "invalid synthetic lowering configuration");
+    }
+    synthetic_crossjit_projection_index = 0;
+    if (synthetic_crossjit_combined_case < -1 ||
+        synthetic_crossjit_combined_case > 3) {
+        return PyErr_Format(PyExc_ValueError, "invalid combined guard configuration");
+    }
+    synthetic_crossjit_provider.struct_size = synthetic_crossjit_combined_case == -1 ?
+        offsetof(PyJitProviderSpec, run_guarded_region) : sizeof(PyJitProviderSpec);
+    synthetic_crossjit_provider.run_guarded_region = synthetic_crossjit_combined_case ?
+        synthetic_crossjit_run_guarded_region : NULL;
+    synthetic_crossjit_provider.supports_single_node_regions = !!single_nodes;
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+crossjit_synthetic_stats(PyObject *Py_UNUSED(module),
+                         PyObject *Py_UNUSED(ignored))
+{
+    return Py_BuildValue(
+        "{sK,sK,sK,sK,sK,sK}",
+        "contract_destroyed", synthetic_crossjit_contract_destroyed,
+        "guard_destroyed", synthetic_crossjit_guard_destroyed,
+        "exec_destroyed", synthetic_crossjit_exec_destroyed,
+        "prepare_called", synthetic_crossjit_prepare_called,
+        "last_guard_assumption_count",
+        synthetic_crossjit_last_guard_assumption_count,
+        "last_guard_property_mask",
+        synthetic_crossjit_last_guard_property_mask);
+}
+
+static PyObject *
+crossjit_synthetic_reset(PyObject *Py_UNUSED(module),
+                         PyObject *Py_UNUSED(ignored))
+{
+    synthetic_crossjit_projection_index = 0;
+    synthetic_crossjit_prepare_called = 0;
+    synthetic_crossjit_contract_destroyed = 0;
+    synthetic_crossjit_guard_destroyed = 0;
+    synthetic_crossjit_exec_destroyed = 0;
+    synthetic_crossjit_last_guard_assumption_count = 0;
+    synthetic_crossjit_last_guard_property_mask = 0;
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+crossjit_stats(PyObject *Py_UNUSED(module), PyObject *Py_UNUSED(ignored))
+{
+    return _PyCrossJit_GetStats(_PyInterpreterState_GET());
+}
+
+/* Provides deterministic counter isolation for semantic-provider tests. */
+static PyObject *
+crossjit_reset_stats(PyObject *Py_UNUSED(module), PyObject *Py_UNUSED(ignored))
+{
+    _PyCrossJit_ResetStats(_PyInterpreterState_GET());
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_functions[] = {
+    {"crossjit_synthetic_register", crossjit_synthetic_register, METH_O, NULL},
+    {"crossjit_synthetic_unregister", crossjit_synthetic_unregister, METH_NOARGS, NULL},
+    {"crossjit_synthetic_configure", crossjit_synthetic_configure, METH_VARARGS, NULL},
+    {"crossjit_synthetic_stats", crossjit_synthetic_stats, METH_NOARGS, NULL},
+    {"crossjit_synthetic_reset", crossjit_synthetic_reset, METH_NOARGS, NULL},
+    {"crossjit_stats", crossjit_stats, METH_NOARGS, NULL},
+    {"crossjit_reset_stats", crossjit_reset_stats, METH_NOARGS, NULL},
     {"get_configs", get_configs, METH_NOARGS},
     {"get_eval_frame_stats", get_eval_frame_stats, METH_NOARGS, NULL},
     {"get_recursion_depth", get_recursion_depth, METH_NOARGS},

@@ -20829,6 +20829,107 @@
             break;
         }
 
+        case _EXT_GUARD_r00: {
+            CHECK_CURRENT_CACHED_VALUES(0);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            _PyStackRef *args;
+            oparg = CURRENT_OPARG();
+            args = &stack_pointer[-oparg];
+            uint16_t plan_index = (uint16_t)CURRENT_OPERAND0_16();
+            if (oparg > PYJIT_REGION_MAX_LIVE_INS) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyObject *inputs[PYJIT_REGION_MAX_LIVE_INS];
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            int input_count = _PyCrossJit_ExecutorPrepareInputs(
+                current_executor, (uint32_t)plan_index, frame, args, oparg,
+                inputs, PYJIT_REGION_MAX_LIVE_INS);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (input_count < 0) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            PyJitResult status = _PyCrossJit_ExecutorRunGuards(
+                current_executor, (uint32_t)plan_index, inputs, input_count);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (status == PYJIT_RESULT_ERROR) {
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_ERROR();
+            }
+            if (status != PYJIT_RESULT_HIT) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            _tos_cache0 = PyStackRef_ZERO_BITS;
+            _tos_cache1 = PyStackRef_ZERO_BITS;
+            _tos_cache2 = PyStackRef_ZERO_BITS;
+            SET_CURRENT_CACHED_VALUES(0);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            break;
+        }
+
+        case _EXT_REGION_EXEC_r01: {
+            CHECK_CURRENT_CACHED_VALUES(0);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            _PyStackRef *args;
+            _PyStackRef res;
+            oparg = CURRENT_OPARG();
+            args = &stack_pointer[-oparg];
+            uint16_t plan_index = (uint16_t)CURRENT_OPERAND0_16();
+            if (oparg > PYJIT_REGION_MAX_LIVE_INS) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyObject *inputs[PYJIT_REGION_MAX_LIVE_INS];
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            int input_count = _PyCrossJit_ExecutorPrepareInputs(
+                current_executor, (uint32_t)plan_index, frame, args, oparg,
+                inputs, PYJIT_REGION_MAX_LIVE_INS);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (input_count < 0) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            PyObject *result = NULL;
+            _PyFrame_SetStackPointer(frame, stack_pointer);
+            PyJitResult status = _PyCrossJit_ExecutorRunRegion(
+                current_executor, (uint32_t)plan_index, inputs, input_count,
+                &result);
+            stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (status == PYJIT_RESULT_ERROR) {
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_ERROR();
+            }
+            if (status != PYJIT_RESULT_HIT) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
+            for (int i = oparg; --i >= 0;) {
+                _PyStackRef input = args[i];
+                args[i] = PyStackRef_NULL;
+                _PyFrame_SetStackPointer(frame, stack_pointer);
+                PyStackRef_XCLOSE(input);
+                stack_pointer = _PyFrame_GetStackPointer(frame);
+            }
+            res = PyStackRef_FromPyObjectSteal(result);
+            _tos_cache0 = res;
+            _tos_cache1 = PyStackRef_ZERO_BITS;
+            _tos_cache2 = PyStackRef_ZERO_BITS;
+            SET_CURRENT_CACHED_VALUES(1);
+            stack_pointer += -oparg;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());
+            break;
+        }
+
         case _SWAP_2_r02: {
             CHECK_CURRENT_CACHED_VALUES(0);
             assert(WITHIN_STACK_BOUNDS_IGNORING_CACHE());

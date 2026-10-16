@@ -12,6 +12,7 @@
 #include "pycore_backoff.h"
 #include "pycore_cell.h"          // PyCell_GetRef()
 #include "pycore_ceval.h"         // _PyEval_LazyImportName(), _PyEval_LazyImportFrom()
+#include "pycore_crossjit.h"      // CrossJIT executor plan dispatch
 #include "pycore_code.h"
 #include "pycore_emscripten_signal.h"  // _Py_CHECK_EMSCRIPTEN_SIGNALS
 #include "pycore_function.h"
@@ -3280,7 +3281,11 @@ dummy_func(
             }
         }
 
-        macro(COMPARE_OP) = _SPECIALIZE_COMPARE_OP + _COMPARE_OP;
+        macro(COMPARE_OP) =
+            _SPECIALIZE_COMPARE_OP +
+            _RECORD_CJRIGHT +
+            _RECORD_CJLEFT +
+            _COMPARE_OP;
 
         macro(COMPARE_OP_FLOAT) =
             _GUARD_TOS_FLOAT + _GUARD_NOS_FLOAT + unused/1 + _COMPARE_OP_FLOAT + _POP_TOP_FLOAT + _POP_TOP_FLOAT;
@@ -4600,6 +4605,14 @@ dummy_func(
 
         macro(CALL_NON_PY_GENERAL) =
             _RECORD_CALLABLE +
+            _RECORD_CJARG0 +
+            _RECORD_CJARG1 +
+            _RECORD_CJARG2 +
+            _RECORD_CJARG3 +
+            _RECORD_CJARG4 +
+            _RECORD_CJARG5 +
+            _RECORD_CJARG6 +
+            _RECORD_CJARG7 +
             unused/1 + // Skip over the counter
             unused/2 +
             _CHECK_IS_NOT_PY_CALLABLE +
@@ -5009,6 +5022,14 @@ dummy_func(
 
         macro(CALL_BUILTIN_FAST_WITH_KEYWORDS) =
             _RECORD_CALLABLE +
+            _RECORD_CJARG0 +
+            _RECORD_CJARG1 +
+            _RECORD_CJARG2 +
+            _RECORD_CJARG3 +
+            _RECORD_CJARG4 +
+            _RECORD_CJARG5 +
+            _RECORD_CJARG6 +
+            _RECORD_CJARG7 +
             unused/1 +
             unused/2 +
             _GUARD_CALLABLE_BUILTIN_FAST_WITH_KEYWORDS +
@@ -5257,6 +5278,15 @@ dummy_func(
 
         macro(CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS) =
             _RECORD_CALLABLE +
+            _RECORD_CJSELF +
+            _RECORD_CJARG0 +
+            _RECORD_CJARG1 +
+            _RECORD_CJARG2 +
+            _RECORD_CJARG3 +
+            _RECORD_CJARG4 +
+            _RECORD_CJARG5 +
+            _RECORD_CJARG6 +
+            _RECORD_CJARG7 +
             unused/1 +
             unused/2 +
             _GUARD_CALLABLE_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS +
@@ -5635,6 +5665,16 @@ dummy_func(
         }
 
         macro(CALL_KW_NON_PY) =
+            _RECORD_CALLABLE_KW +
+            _RECORD_CJKWSELF +
+            _RECORD_CJKWARG0 +
+            _RECORD_CJKWARG1 +
+            _RECORD_CJKWARG2 +
+            _RECORD_CJKWARG3 +
+            _RECORD_CJKWARG4 +
+            _RECORD_CJKWARG5 +
+            _RECORD_CJKWARG6 +
+            _RECORD_CJKWARG7 +
             unused/1 + // Skip over the counter
             unused/2 +
             _CHECK_IS_NOT_PY_CALLABLE_KW +
@@ -5965,7 +6005,56 @@ dummy_func(
             DEAD(rhs);
         }
 
-        macro(BINARY_OP) = _SPECIALIZE_BINARY_OP + _RECORD_TOS_TYPE + _RECORD_NOS_TYPE + unused/4 + _BINARY_OP + POP_TOP + POP_TOP;
+        /* A generic provider guard.  It does not consume stack references so
+         * a MISS can leave through the ordinary Tier-2 side-exit machinery. */
+        op(_EXT_GUARD, (plan_index/1, args[oparg] -- args[oparg])) {
+            EXIT_IF(oparg > PYJIT_REGION_MAX_LIVE_INS);
+            PyObject *inputs[PYJIT_REGION_MAX_LIVE_INS];
+            int input_count = _PyCrossJit_ExecutorPrepareInputs(
+                current_executor, (uint32_t)plan_index, frame, args, oparg,
+                inputs, PYJIT_REGION_MAX_LIVE_INS);
+            EXIT_IF(input_count < 0);
+            PyJitResult status = _PyCrossJit_ExecutorRunGuards(
+                current_executor, (uint32_t)plan_index, inputs, input_count);
+            if (status == PYJIT_RESULT_ERROR) {
+                ERROR_NO_POP();
+            }
+            EXIT_IF(status != PYJIT_RESULT_HIT);
+        }
+
+        /* A generic provider execution uop.  It closes inputs only after the
+         * provider has returned a newly-owned result on a confirmed HIT. */
+        op(_EXT_REGION_EXEC, (plan_index/1, args[oparg] -- res)) {
+            EXIT_IF(oparg > PYJIT_REGION_MAX_LIVE_INS);
+            PyObject *inputs[PYJIT_REGION_MAX_LIVE_INS];
+            int input_count = _PyCrossJit_ExecutorPrepareInputs(
+                current_executor, (uint32_t)plan_index, frame, args, oparg,
+                inputs, PYJIT_REGION_MAX_LIVE_INS);
+            EXIT_IF(input_count < 0);
+            PyObject *result = NULL;
+            PyJitResult status = _PyCrossJit_ExecutorRunRegion(
+                current_executor, (uint32_t)plan_index, inputs, input_count,
+                &result);
+            if (status == PYJIT_RESULT_ERROR) {
+                ERROR_NO_POP();
+            }
+            EXIT_IF(status != PYJIT_RESULT_HIT);
+            /* Generic calls include the NULL self sentinel.  Clear roots
+             * before releasing them, just as CloseStack does for objects. */
+            for (int i = oparg; --i >= 0;) {
+                _PyStackRef input = args[i];
+                args[i] = PyStackRef_NULL;
+                PyStackRef_XCLOSE(input);
+            }
+            DEAD(args);
+            INPUTS_DEAD();
+            res = PyStackRef_FromPyObjectSteal(result);
+        }
+
+        /* CrossJIT transfer functions may need the observed properties of
+         * both operands.  The optimizer still discards the objects unless an
+         * exact-type provider is registered for this operation. */
+        macro(BINARY_OP) = _SPECIALIZE_BINARY_OP + _RECORD_TOS + _RECORD_NOS + unused/4 + _BINARY_OP + POP_TOP + POP_TOP;
 
         pure replicate(2:4) inst(SWAP, (bottom, unused[oparg-2], top --
                     bottom, unused[oparg-2], top)) {
@@ -6450,6 +6539,148 @@ dummy_func(
 
         tier2 op(_RECORD_CALLABLE, (func, self, args[oparg] -- func, self, args[oparg])) {
             RECORD_VALUE(PyStackRef_AsPyObjectBorrow(func));
+        }
+
+        tier2 op(_RECORD_CJSELF, (func, self, args[oparg] -- func, self, args[oparg])) {
+            if (!PyStackRef_IsNull(self) && _PyCrossJit_ShouldObserveCallSite(
+                    PyStackRef_AsPyObjectBorrow(func),PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(self));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWSELF, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (!PyStackRef_IsNull(self) && _PyCrossJit_ShouldObserveCallSite(
+                    PyStackRef_AsPyObjectBorrow(func),PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(self));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG0, (func, self, args[oparg] -- func, self, args[oparg])) {
+            PyObject *callable = PyStackRef_AsPyObjectBorrow(func);
+            if (oparg >= 1 && _PyCrossJit_ShouldObserveCallSite(callable,PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[0]));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG1, (func, self, args[oparg] -- func, self, args[oparg])) {
+            PyObject *callable = PyStackRef_AsPyObjectBorrow(func);
+            if (oparg >= 2 && _PyCrossJit_ShouldObserveCallSite(callable,PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[1]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG0, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>=1 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[0]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG1, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>=2 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[1]));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG2, (func, self, args[oparg] -- func, self, args[oparg])) {
+            if (oparg>2 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[2]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG2, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>2 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[2]));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG3, (func, self, args[oparg] -- func, self, args[oparg])) {
+            if (oparg>3 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[3]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG3, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>3 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[3]));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG4, (func, self, args[oparg] -- func, self, args[oparg])) {
+            if (oparg>4 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[4]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG4, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>4 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[4]));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG5, (func, self, args[oparg] -- func, self, args[oparg])) {
+            if (oparg>5 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[5]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG5, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>5 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[5]));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG6, (func, self, args[oparg] -- func, self, args[oparg])) {
+            if (oparg>6 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[6]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG6, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>6 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[6]));
+            }
+        }
+
+        tier2 op(_RECORD_CJARG7, (func, self, args[oparg] -- func, self, args[oparg])) {
+            if (oparg>7 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[7]));
+            }
+        }
+
+        tier2 op(_RECORD_CJKWARG7, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {
+            if (oparg>7 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+                RECORD_VALUE(PyStackRef_AsPyObjectBorrow(args[7]));
+            }
+        }
+
+        tier2 op(_RECORD_CJRIGHT, (left, right -- left, right)) {
+            PyObject *left_object = PyStackRef_AsPyObjectBorrow(left);
+            PyObject *right_object = PyStackRef_AsPyObjectBorrow(right);
+            if (_PyCrossJit_ShouldObserveCompare(
+                    left_object, right_object, oparg >> 5)) {
+                RECORD_VALUE(right_object);
+            }
+        }
+
+        tier2 op(_RECORD_CJLEFT, (left, right -- left, right)) {
+            PyObject *left_object = PyStackRef_AsPyObjectBorrow(left);
+            PyObject *right_object = PyStackRef_AsPyObjectBorrow(right);
+            if (_PyCrossJit_ShouldObserveCompare(
+                    left_object, right_object, oparg >> 5)) {
+                RECORD_VALUE(left_object);
+            }
         }
 
         tier2 op(_RECORD_CALLABLE_KW, (func, self, args[oparg], kwnames -- func, self, args[oparg], kwnames)) {

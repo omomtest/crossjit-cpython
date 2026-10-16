@@ -924,6 +924,58 @@ struct _is {
     unsigned long feature_flags;
 
     PyObject *dict;  /* Stores per-interpreter state */
+    /* Exact operation/type/callable keys map to borrowed static provider
+     * descriptors; the mutex protects lazy registry creation. */
+    PyObject *crossjit_provider_registry;
+    /* Exact semantic-class descriptors contain only structure, Provider
+     * identity and S_H; no trace-physical or Provider-private bytes enter. */
+    PyObject *crossjit_host_proof_cache;
+    PyMutex crossjit_provider_registry_mutex;
+    /* Per-interpreter counters are separate from pystats so experiments can
+     * reset them without perturbing normal JIT telemetry. */
+    struct {
+        /* Semantic-plane work. */
+        uint64_t recognized_nodes;
+        uint64_t provider_first_recognized;
+        uint64_t scalar_speculations_avoided;
+        uint64_t assumptions_before_dedup;
+        uint64_t assumptions_after_dedup;
+        uint64_t host_regions_considered;
+        uint64_t host_regions_proven;
+        uint64_t semantic_class_created;
+        uint64_t semantic_class_reused;
+        uint64_t semantic_class_hit;
+        uint64_t semantic_class_miss;
+        /* Semantic classes never cache trace-specific stack mappings. */
+        uint64_t physical_proof_attempted;
+        uint64_t physical_proof_validated;
+        uint64_t provider_specialization_created;
+        uint64_t provider_specialization_rebuilt;
+        uint64_t reject_unsupported_node;
+        uint64_t reject_unsupported_contract;
+        uint64_t reject_unprofitable;
+        /* Host materialization decisions. */
+        uint64_t materialized_values;
+        uint64_t virtual_values;
+        uint64_t transient_local_regions;
+        uint64_t transient_local_exec_hits;
+        uint64_t transient_local_guard_misses;
+        uint64_t type_guard_regions;
+        uint64_t type_guard_exec_hits;
+        uint64_t type_guard_checks;
+        uint64_t type_guard_misses;
+        /* Region formation and rewrite outcomes. */
+        uint64_t rejected_regions;
+        uint64_t formed_regions;
+        uint64_t rewritten_regions;
+        uint64_t published_regions;
+        /* Runtime provider dispatch outcomes. */
+        uint64_t guard_hits;
+        uint64_t combined_guard_exec_calls;
+        uint64_t guard_misses;
+        uint64_t exec_hits;
+        uint64_t exec_misses;
+    } crossjit_stats;
 
     PyObject *sysdict_copy;
     PyObject *builtins_copy;

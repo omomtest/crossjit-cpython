@@ -1456,6 +1456,8 @@ _Py_uop_abstractcontext_fini(JitOptContext *ctx)
             Py_CLEAR(sym->value.value);
         }
     }
+    _PyCrossJit_AnalysisFree(ctx->crossjit);
+    ctx->crossjit = NULL;
 }
 
 // Leave a bit of space to push values before checking that there is space for a new frame
@@ -1493,6 +1495,8 @@ _Py_uop_abstractcontext_init(JitOptContext *ctx, _PyBloomFilter *dependencies)
     ctx->out_of_space = false;
     ctx->contradiction = false;
     ctx->builtins_watched = false;
+    /* The semantic state is allocated lazily only after a provider match. */
+    ctx->crossjit = NULL;
     ctx->dependencies = dependencies;
 }
 

@@ -76,6 +76,280 @@ void _PyOpcode_RecordFunction_CALLABLE(_PyInterpreterFrame *frame, _PyStackRef *
     Py_INCREF(*recorded_value);
 }
 
+void _PyOpcode_RecordFunction_CJSELF(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    if (!PyStackRef_IsNull(self) && _PyCrossJit_ShouldObserveCallSite(
+                    PyStackRef_AsPyObjectBorrow(func),PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(self);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWSELF(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (!PyStackRef_IsNull(self) && _PyCrossJit_ShouldObserveCallSite(
+                    PyStackRef_AsPyObjectBorrow(func),PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(self);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG0(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    PyObject *callable = PyStackRef_AsPyObjectBorrow(func);
+    if (oparg >= 1 && _PyCrossJit_ShouldObserveCallSite(callable,PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[0]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG1(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    PyObject *callable = PyStackRef_AsPyObjectBorrow(func);
+    if (oparg >= 2 && _PyCrossJit_ShouldObserveCallSite(callable,PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[1]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG0(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>=1 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[0]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG1(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>=2 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[1]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG2(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    if (oparg>2 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[2]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG2(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>2 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[2]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG3(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    if (oparg>3 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[3]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG3(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>3 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[3]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG4(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    if (oparg>4 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[4]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG4(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>4 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[4]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG5(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    if (oparg>5 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[5]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG5(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>5 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[5]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG6(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    if (oparg>6 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[6]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG6(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>6 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[6]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJARG7(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-oparg];
+    self = stack_pointer[-1 - oparg];
+    func = stack_pointer[-2 - oparg];
+    if (oparg>7 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[7]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJKWARG7(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef func;
+    _PyStackRef self;
+    _PyStackRef *args;
+    args = &stack_pointer[-1 - oparg];
+    self = stack_pointer[-2 - oparg];
+    func = stack_pointer[-3 - oparg];
+    if (oparg>7 && _PyCrossJit_ShouldObserveCallSite(PyStackRef_AsPyObjectBorrow(func),
+                    PyStackRef_IsNull(self)?NULL:PyStackRef_AsPyObjectBorrow(self))) {
+        *recorded_value = (PyObject *)PyStackRef_AsPyObjectBorrow(args[7]);
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJRIGHT(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef left;
+    _PyStackRef right;
+    right = stack_pointer[-1];
+    left = stack_pointer[-2];
+    PyObject *left_object = PyStackRef_AsPyObjectBorrow(left);
+    PyObject *right_object = PyStackRef_AsPyObjectBorrow(right);
+    if (_PyCrossJit_ShouldObserveCompare(
+                    left_object, right_object, oparg >> 5)) {
+        *recorded_value = (PyObject *)right_object;
+        Py_INCREF(*recorded_value);
+    }
+}
+
+void _PyOpcode_RecordFunction_CJLEFT(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
+    _PyStackRef left;
+    _PyStackRef right;
+    right = stack_pointer[-1];
+    left = stack_pointer[-2];
+    PyObject *left_object = PyStackRef_AsPyObjectBorrow(left);
+    PyObject *right_object = PyStackRef_AsPyObjectBorrow(right);
+    if (_PyCrossJit_ShouldObserveCompare(
+                    left_object, right_object, oparg >> 5)) {
+        *recorded_value = (PyObject *)left_object;
+        Py_INCREF(*recorded_value);
+    }
+}
+
 void _PyOpcode_RecordFunction_CALLABLE_KW(_PyInterpreterFrame *frame, _PyStackRef *stack_pointer, int oparg, PyObject **recorded_value) {
     _PyStackRef func;
     func = stack_pointer[-3 - oparg];
@@ -100,12 +374,32 @@ void _PyOpcode_RecordFunction_CODE(_PyInterpreterFrame *frame, _PyStackRef *stac
 
 #define _RECORD_TOS_TYPE_INDEX 1
 #define _RECORD_NOS_INDEX 2
-#define _RECORD_NOS_TYPE_INDEX 3
-#define _RECORD_3OS_GEN_FUNC_INDEX 4
-#define _RECORD_TOS_INDEX 5
-#define _RECORD_CALLABLE_INDEX 6
-#define _RECORD_CALLABLE_KW_INDEX 7
-#define _RECORD_4OS_INDEX 8
+#define _RECORD_TOS_INDEX 3
+#define _RECORD_NOS_TYPE_INDEX 4
+#define _RECORD_3OS_GEN_FUNC_INDEX 5
+#define _RECORD_CJRIGHT_INDEX 6
+#define _RECORD_CJLEFT_INDEX 7
+#define _RECORD_CALLABLE_INDEX 8
+#define _RECORD_CJARG0_INDEX 9
+#define _RECORD_CJARG1_INDEX 10
+#define _RECORD_CJARG2_INDEX 11
+#define _RECORD_CJARG3_INDEX 12
+#define _RECORD_CJARG4_INDEX 13
+#define _RECORD_CJARG5_INDEX 14
+#define _RECORD_CJARG6_INDEX 15
+#define _RECORD_CJARG7_INDEX 16
+#define _RECORD_CJSELF_INDEX 17
+#define _RECORD_CALLABLE_KW_INDEX 18
+#define _RECORD_CJKWSELF_INDEX 19
+#define _RECORD_CJKWARG0_INDEX 20
+#define _RECORD_CJKWARG1_INDEX 21
+#define _RECORD_CJKWARG2_INDEX 22
+#define _RECORD_CJKWARG3_INDEX 23
+#define _RECORD_CJKWARG4_INDEX 24
+#define _RECORD_CJKWARG5_INDEX 25
+#define _RECORD_CJKWARG6_INDEX 26
+#define _RECORD_CJKWARG7_INDEX 27
+#define _RECORD_4OS_INDEX 28
 
 const _PyOpcodeRecordEntry _PyOpcode_RecordEntries[256] = {
         [TO_BOOL_BOOL] = {1, {_RECORD_TOS_TYPE_INDEX}},
@@ -116,22 +410,22 @@ const _PyOpcodeRecordEntry _PyOpcode_RecordEntries[256] = {
         [TO_BOOL_LIST] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [TO_BOOL_STR] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [TO_BOOL_ALWAYS_TRUE] = {1, {_RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_MULTIPLY_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_ADD_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBTRACT_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_MULTIPLY_FLOAT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_ADD_FLOAT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBTRACT_FLOAT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_ADD_UNICODE] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_EXTEND] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_INPLACE_ADD_UNICODE] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBSCR_LIST_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBSCR_LIST_SLICE] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBSCR_STR_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBSCR_USTR_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBSCR_TUPLE_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBSCR_DICT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
-        [BINARY_OP_SUBSCR_GETITEM] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
+        [BINARY_OP_MULTIPLY_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_ADD_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBTRACT_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_MULTIPLY_FLOAT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_ADD_FLOAT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBTRACT_FLOAT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_ADD_UNICODE] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_EXTEND] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_INPLACE_ADD_UNICODE] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBSCR_LIST_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBSCR_LIST_SLICE] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBSCR_STR_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBSCR_USTR_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBSCR_TUPLE_INT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBSCR_DICT] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
+        [BINARY_OP_SUBSCR_GETITEM] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
         [STORE_SUBSCR] = {1, {_RECORD_NOS_TYPE_INDEX}},
         [STORE_SUBSCR_LIST_INT] = {1, {_RECORD_NOS_TYPE_INDEX}},
         [STORE_SUBSCR_DICT] = {1, {_RECORD_NOS_TYPE_INDEX}},
@@ -155,6 +449,10 @@ const _PyOpcodeRecordEntry _PyOpcode_RecordEntries[256] = {
         [STORE_ATTR_INSTANCE_VALUE] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [STORE_ATTR_WITH_HINT] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [STORE_ATTR_SLOT] = {1, {_RECORD_TOS_TYPE_INDEX}},
+        [COMPARE_OP] = {2, {_RECORD_CJRIGHT_INDEX, _RECORD_CJLEFT_INDEX}},
+        [COMPARE_OP_FLOAT] = {2, {_RECORD_CJRIGHT_INDEX, _RECORD_CJLEFT_INDEX}},
+        [COMPARE_OP_INT] = {2, {_RECORD_CJRIGHT_INDEX, _RECORD_CJLEFT_INDEX}},
+        [COMPARE_OP_STR] = {2, {_RECORD_CJRIGHT_INDEX, _RECORD_CJLEFT_INDEX}},
         [GET_ITER] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [GET_ITER_SELF] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [GET_ITER_VIRTUAL] = {1, {_RECORD_TOS_TYPE_INDEX}},
@@ -169,35 +467,35 @@ const _PyOpcodeRecordEntry _PyOpcode_RecordEntries[256] = {
         [LOAD_ATTR_NONDESCRIPTOR_WITH_VALUES] = {1, {_RECORD_TOS_INDEX}},
         [LOAD_ATTR_NONDESCRIPTOR_NO_DICT] = {1, {_RECORD_TOS_INDEX}},
         [LOAD_ATTR_METHOD_LAZY_DICT] = {1, {_RECORD_TOS_INDEX}},
-        [CALL] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_PY_GENERAL] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_BOUND_METHOD_GENERAL] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_NON_PY_GENERAL] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_BOUND_METHOD_EXACT_ARGS] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_PY_EXACT_ARGS] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_TYPE_1] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_STR_1] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_TUPLE_1] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_ALLOC_AND_ENTER_INIT] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_BUILTIN_CLASS] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_BUILTIN_O] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_BUILTIN_FAST] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_BUILTIN_FAST_WITH_KEYWORDS] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_LEN] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_ISINSTANCE] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_LIST_APPEND] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_METHOD_DESCRIPTOR_O] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_METHOD_DESCRIPTOR_NOARGS] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_METHOD_DESCRIPTOR_FAST] = {1, {_RECORD_CALLABLE_INDEX}},
-        [CALL_KW_PY] = {1, {_RECORD_CALLABLE_KW_INDEX}},
-        [CALL_KW_BOUND_METHOD] = {1, {_RECORD_CALLABLE_KW_INDEX}},
-        [CALL_KW] = {1, {_RECORD_CALLABLE_KW_INDEX}},
-        [CALL_KW_NON_PY] = {1, {_RECORD_CALLABLE_KW_INDEX}},
+        [CALL] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_PY_GENERAL] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_BOUND_METHOD_GENERAL] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_NON_PY_GENERAL] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_BOUND_METHOD_EXACT_ARGS] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_PY_EXACT_ARGS] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_TYPE_1] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_STR_1] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_TUPLE_1] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_ALLOC_AND_ENTER_INIT] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_BUILTIN_CLASS] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_BUILTIN_O] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_BUILTIN_FAST] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_BUILTIN_FAST_WITH_KEYWORDS] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_LEN] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_ISINSTANCE] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_LIST_APPEND] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_METHOD_DESCRIPTOR_O] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_METHOD_DESCRIPTOR_NOARGS] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_METHOD_DESCRIPTOR_FAST] = {10, {_RECORD_CALLABLE_INDEX, _RECORD_CJARG0_INDEX, _RECORD_CJARG1_INDEX, _RECORD_CJARG2_INDEX, _RECORD_CJARG3_INDEX, _RECORD_CJARG4_INDEX, _RECORD_CJARG5_INDEX, _RECORD_CJARG6_INDEX, _RECORD_CJARG7_INDEX, _RECORD_CJSELF_INDEX}},
+        [CALL_KW_PY] = {10, {_RECORD_CALLABLE_KW_INDEX, _RECORD_CJKWSELF_INDEX, _RECORD_CJKWARG0_INDEX, _RECORD_CJKWARG1_INDEX, _RECORD_CJKWARG2_INDEX, _RECORD_CJKWARG3_INDEX, _RECORD_CJKWARG4_INDEX, _RECORD_CJKWARG5_INDEX, _RECORD_CJKWARG6_INDEX, _RECORD_CJKWARG7_INDEX}},
+        [CALL_KW_BOUND_METHOD] = {10, {_RECORD_CALLABLE_KW_INDEX, _RECORD_CJKWSELF_INDEX, _RECORD_CJKWARG0_INDEX, _RECORD_CJKWARG1_INDEX, _RECORD_CJKWARG2_INDEX, _RECORD_CJKWARG3_INDEX, _RECORD_CJKWARG4_INDEX, _RECORD_CJKWARG5_INDEX, _RECORD_CJKWARG6_INDEX, _RECORD_CJKWARG7_INDEX}},
+        [CALL_KW] = {10, {_RECORD_CALLABLE_KW_INDEX, _RECORD_CJKWSELF_INDEX, _RECORD_CJKWARG0_INDEX, _RECORD_CJKWARG1_INDEX, _RECORD_CJKWARG2_INDEX, _RECORD_CJKWARG3_INDEX, _RECORD_CJKWARG4_INDEX, _RECORD_CJKWARG5_INDEX, _RECORD_CJKWARG6_INDEX, _RECORD_CJKWARG7_INDEX}},
+        [CALL_KW_NON_PY] = {10, {_RECORD_CALLABLE_KW_INDEX, _RECORD_CJKWSELF_INDEX, _RECORD_CJKWARG0_INDEX, _RECORD_CJKWARG1_INDEX, _RECORD_CJKWARG2_INDEX, _RECORD_CJKWARG3_INDEX, _RECORD_CJKWARG4_INDEX, _RECORD_CJKWARG5_INDEX, _RECORD_CJKWARG6_INDEX, _RECORD_CJKWARG7_INDEX}},
         [CALL_FUNCTION_EX] = {1, {_RECORD_4OS_INDEX}},
         [CALL_EX_PY] = {1, {_RECORD_4OS_INDEX}},
         [CALL_EX_NON_PY_GENERAL] = {1, {_RECORD_4OS_INDEX}},
-        [BINARY_OP] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_TYPE_INDEX}},
+        [BINARY_OP] = {2, {_RECORD_NOS_INDEX, _RECORD_TOS_INDEX}},
 };
 
 const _PyOpcodeRecordSlotMap _PyOpcode_RecordSlotMaps[256] = {
@@ -218,6 +516,7 @@ const _PyOpcodeRecordSlotMap _PyOpcode_RecordSlotMaps[256] = {
         [STORE_ATTR_INSTANCE_VALUE] = {1, 0, {0}},
         [STORE_ATTR_WITH_HINT] = {1, 0, {0}},
         [STORE_ATTR_SLOT] = {1, 0, {0}},
+        [COMPARE_OP] = {2, 0, {0, 1}},
         [GET_ITER] = {1, 0, {0}},
         [GET_ITER_SELF] = {1, 0, {0}},
         [GET_ITER_VIRTUAL] = {1, 0, {0}},
@@ -230,32 +529,53 @@ const _PyOpcodeRecordSlotMap _PyOpcode_RecordSlotMaps[256] = {
         [LOAD_ATTR_METHOD_LAZY_DICT] = {1, 1, {0}},
         [CALL_PY_GENERAL] = {1, 0, {0}},
         [CALL_BOUND_METHOD_GENERAL] = {1, 1, {0}},
-        [CALL_NON_PY_GENERAL] = {1, 0, {0}},
+        [CALL_NON_PY_GENERAL] = {9, 0, {0, 1, 2, 3, 4, 5, 6, 7, 8}},
         [CALL_BOUND_METHOD_EXACT_ARGS] = {1, 1, {0}},
         [CALL_PY_EXACT_ARGS] = {1, 0, {0}},
         [CALL_ALLOC_AND_ENTER_INIT] = {1, 0, {0}},
         [CALL_BUILTIN_CLASS] = {1, 0, {0}},
         [CALL_BUILTIN_O] = {1, 0, {0}},
         [CALL_BUILTIN_FAST] = {1, 0, {0}},
-        [CALL_BUILTIN_FAST_WITH_KEYWORDS] = {1, 0, {0}},
+        [CALL_BUILTIN_FAST_WITH_KEYWORDS] = {9, 0, {0, 1, 2, 3, 4, 5, 6, 7, 8}},
         [CALL_METHOD_DESCRIPTOR_O] = {1, 0, {0}},
-        [CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS] = {1, 0, {0}},
+        [CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS] = {10, 0, {0, 9, 1, 2, 3, 4, 5, 6, 7, 8}},
         [CALL_METHOD_DESCRIPTOR_NOARGS] = {1, 0, {0}},
         [CALL_KW_PY] = {1, 0, {0}},
         [CALL_KW_BOUND_METHOD] = {1, 0, {0}},
+        [CALL_KW_NON_PY] = {10, 0, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}},
         [CALL_EX_PY] = {1, 0, {0}},
-        [BINARY_OP] = {2, 2, {1, 0}},
+        [BINARY_OP] = {2, 0, {1, 0}},
 };
 
-const _Py_RecordFuncPtr _PyOpcode_RecordFunctions[9] = {
+const _Py_RecordFuncPtr _PyOpcode_RecordFunctions[29] = {
         [0] = NULL,
         [_RECORD_TOS_TYPE_INDEX] = _PyOpcode_RecordFunction_TOS_TYPE,
         [_RECORD_NOS_INDEX] = _PyOpcode_RecordFunction_NOS,
+        [_RECORD_TOS_INDEX] = _PyOpcode_RecordFunction_TOS,
         [_RECORD_NOS_TYPE_INDEX] = _PyOpcode_RecordFunction_NOS_TYPE,
         [_RECORD_3OS_GEN_FUNC_INDEX] = _PyOpcode_RecordFunction_3OS_GEN_FUNC,
-        [_RECORD_TOS_INDEX] = _PyOpcode_RecordFunction_TOS,
+        [_RECORD_CJRIGHT_INDEX] = _PyOpcode_RecordFunction_CJRIGHT,
+        [_RECORD_CJLEFT_INDEX] = _PyOpcode_RecordFunction_CJLEFT,
         [_RECORD_CALLABLE_INDEX] = _PyOpcode_RecordFunction_CALLABLE,
+        [_RECORD_CJARG0_INDEX] = _PyOpcode_RecordFunction_CJARG0,
+        [_RECORD_CJARG1_INDEX] = _PyOpcode_RecordFunction_CJARG1,
+        [_RECORD_CJARG2_INDEX] = _PyOpcode_RecordFunction_CJARG2,
+        [_RECORD_CJARG3_INDEX] = _PyOpcode_RecordFunction_CJARG3,
+        [_RECORD_CJARG4_INDEX] = _PyOpcode_RecordFunction_CJARG4,
+        [_RECORD_CJARG5_INDEX] = _PyOpcode_RecordFunction_CJARG5,
+        [_RECORD_CJARG6_INDEX] = _PyOpcode_RecordFunction_CJARG6,
+        [_RECORD_CJARG7_INDEX] = _PyOpcode_RecordFunction_CJARG7,
+        [_RECORD_CJSELF_INDEX] = _PyOpcode_RecordFunction_CJSELF,
         [_RECORD_CALLABLE_KW_INDEX] = _PyOpcode_RecordFunction_CALLABLE_KW,
+        [_RECORD_CJKWSELF_INDEX] = _PyOpcode_RecordFunction_CJKWSELF,
+        [_RECORD_CJKWARG0_INDEX] = _PyOpcode_RecordFunction_CJKWARG0,
+        [_RECORD_CJKWARG1_INDEX] = _PyOpcode_RecordFunction_CJKWARG1,
+        [_RECORD_CJKWARG2_INDEX] = _PyOpcode_RecordFunction_CJKWARG2,
+        [_RECORD_CJKWARG3_INDEX] = _PyOpcode_RecordFunction_CJKWARG3,
+        [_RECORD_CJKWARG4_INDEX] = _PyOpcode_RecordFunction_CJKWARG4,
+        [_RECORD_CJKWARG5_INDEX] = _PyOpcode_RecordFunction_CJKWARG5,
+        [_RECORD_CJKWARG6_INDEX] = _PyOpcode_RecordFunction_CJKWARG6,
+        [_RECORD_CJKWARG7_INDEX] = _PyOpcode_RecordFunction_CJKWARG7,
         [_RECORD_4OS_INDEX] = _PyOpcode_RecordFunction_4OS,
 };
 

@@ -257,6 +257,7 @@ _PyExecutor_Free(_PyExecutorObject *self)
 #ifdef _Py_JIT
     _PyJIT_Free(self);
 #endif
+    _PyCrossJit_ExecutorPlansClear(self);
     PyObject_GC_Del(self);
 }
 
@@ -443,7 +444,7 @@ executor_traverse(PyObject *o, visitproc visit, void *arg)
     for (uint32_t i = 0; i < executor->exit_count; i++) {
         Py_VISIT(executor->exits[i].executor);
     }
-    return 0;
+    return _PyCrossJit_ExecutorPlansTraverse(executor, visit, arg);
 }
 
 static PyObject *
@@ -1457,6 +1458,8 @@ allocate_executor(int exit_count, int length)
     res->trace = (_PyUOpInstruction *)(res->exits + exit_count);
     res->code_size = length;
     res->exit_count = exit_count;
+    res->crossjit_plan_count = 0;
+    res->crossjit_plans = NULL;
     res->jit_registration = NULL;
     return res;
 }
@@ -1540,6 +1543,11 @@ make_executor_from_uops(_PyThreadStateImpl *tstate, _PyUOpInstruction *buffer, i
     int exit_count = count_exits(buffer, length);
     _PyExecutorObject *executor = allocate_executor(exit_count, length);
     if (executor == NULL) {
+        _PyCrossJit_FreePlansFromUops(buffer, length);
+        return NULL;
+    }
+    if (_PyCrossJit_ExecutorPlansInit(executor, buffer, length) < 0) {
+        _PyExecutor_Free(executor);
         return NULL;
     }
 
@@ -1691,6 +1699,7 @@ uop_optimize(
     bool is_noopt = !tstate->interp->opt_config.uops_optimize_enabled;
     int curr_stackentries = _tstate->jit_tracer_state->initial_state.stack_depth;
     int length = uop_buffer_length(&_tstate->jit_tracer_state->code_buffer);
+    int original_length = length;
     if (length <= CODE_SIZE_NO_PROGRESS) {
         return 0;
     }
@@ -1713,6 +1722,34 @@ uop_optimize(
     }
     assert(length < UOP_MAX_TRACE_LENGTH);
     assert(length >= 1);
+    if (!is_noopt) {
+        bool transferred[UOP_MAX_TRACE_LENGTH] = {false};
+        _PyUOpInstruction *original =
+            _tstate->jit_tracer_state->code_buffer.start;
+        /* Recorder operands own references in the original trace.  Optimizer
+         * output normally transfers that ownership by copying recorder uops,
+         * but an optimization or extension rewrite may remove a recorder.
+         * Match copies as a multiset and release every untransferred owner. */
+        for (int out = 0; out < length; out++) {
+            if (!(_PyUop_Flags[buffer[out].opcode] & HAS_RECORDS_VALUE_FLAG)) {
+                continue;
+            }
+            for (int in = 0; in < original_length; in++) {
+                if (!transferred[in] &&
+                    (_PyUop_Flags[original[in].opcode] & HAS_RECORDS_VALUE_FLAG) &&
+                    original[in].operand0 == buffer[out].operand0) {
+                    transferred[in] = true;
+                    break;
+                }
+            }
+        }
+        for (int in = 0; in < original_length; in++) {
+            if (!transferred[in] &&
+                (_PyUop_Flags[original[in].opcode] & HAS_RECORDS_VALUE_FLAG)) {
+                Py_XDECREF((PyObject *)(uintptr_t)original[in].operand0);
+            }
+        }
+    }
     /* Fix up */
     for (int pc = 0; pc < length; pc++) {
         int opcode = buffer[pc].opcode;

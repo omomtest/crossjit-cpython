@@ -442,6 +442,7 @@ PYTHON_OBJS=	\
 		Python/compile.o \
 		Python/context.o \
 		Python/critical_section.o \
+		Python/crossjit.o \
 		Python/crossinterp.o \
 		Python/dynamic_annotations.o \
 		Python/errors.o \

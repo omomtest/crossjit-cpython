@@ -271,6 +271,16 @@
             stack_pointer[0] = v;
             stack_pointer += 1;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            uint32_t crossjit_uop_index =
+            (uint32_t)uop_buffer_length(&ctx->out_buffer);
+            int crossjit_status = _PyCrossJit_AnalyzeUnary(
+                ctx, PYJIT_UNARY_NEGATIVE, value, res, crossjit_uop_index);
+            if (crossjit_status < 0) {
+                goto error;
+            }
+            if (crossjit_status > 0) {
+                ADD_OP(_UNARY_NEGATIVE, 0, 0);
+            }
             break;
         }
 
@@ -2960,6 +2970,13 @@
             stack_pointer[-2] = res;
             stack_pointer += -1;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            uint32_t crossjit_uop_index =
+            (uint32_t)uop_buffer_length(&ctx->out_buffer);
+            if (_PyCrossJit_AnalyzeCompare(
+                                       ctx, oparg >> 5, left, right, res,
+                                       crossjit_uop_index) < 0) {
+                goto error;
+            }
             break;
         }
 
@@ -4147,8 +4164,31 @@
         }
 
         case _CALL_NON_PY_GENERAL: {
+            JitOptRef *args;
+            JitOptRef self_or_null;
+            JitOptRef callable;
             JitOptRef res;
+            args = &stack_pointer[-oparg];
+            self_or_null = stack_pointer[-1 - oparg];
+            callable = stack_pointer[-2 - oparg];
             res = sym_new_not_null(ctx);
+            if (oparg <= PYJIT_OPERATION_MAX_OPERANDS && sym_is_null(self_or_null)) {
+                CHECK_STACK_BOUNDS(-1 - oparg);
+                stack_pointer[-2 - oparg] = res;
+                stack_pointer += -1 - oparg;
+                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                uint32_t crossjit_uop_index =
+                (uint32_t)uop_buffer_length(&ctx->out_buffer);
+                int crossjit_status = _PyCrossJit_AnalyzeCall(
+                    ctx, callable, args, oparg, res, crossjit_uop_index);
+                if (crossjit_status < 0) {
+                    goto error;
+                }
+                if (crossjit_status > 0) {
+                    ADD_OP(_CALL_NON_PY_GENERAL, oparg, 0);
+                }
+                stack_pointer += 1 + oparg;
+            }
             CHECK_STACK_BOUNDS(-1 - oparg);
             stack_pointer[-2 - oparg] = res;
             stack_pointer += -1 - oparg;
@@ -4597,9 +4637,21 @@
         }
 
         case _CALL_BUILTIN_FAST_WITH_KEYWORDS: {
+            JitOptRef *args;
+            JitOptRef self_or_null;
             JitOptRef callable;
+            args = &stack_pointer[-oparg];
+            self_or_null = stack_pointer[-1 - oparg];
             callable = stack_pointer[-2 - oparg];
+            JitOptRef original_callable=callable;
             callable = sym_new_not_null(ctx);
+            if (oparg<=PYJIT_OPERATION_MAX_OPERANDS && sym_is_null(self_or_null)) {
+                stack_pointer[-2 - oparg] = callable;
+                uint32_t index=(uint32_t)uop_buffer_length(&ctx->out_buffer);
+                int status=_PyCrossJit_AnalyzeCall(ctx,original_callable,args,oparg,callable,index);
+                if (status<0) { goto error; }
+                if (status>0) { ADD_OP(_CALL_BUILTIN_FAST_WITH_KEYWORDS,oparg,0); }
+            }
             stack_pointer[-2 - oparg] = callable;
             break;
         }
@@ -4885,19 +4937,26 @@
         }
 
         case _CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS: {
+            JitOptRef *args;
             JitOptRef self_or_null;
             JitOptRef callable;
+            args = &stack_pointer[-oparg];
             self_or_null = stack_pointer[-1 - oparg];
             callable = stack_pointer[-2 - oparg];
-            PyObject *callable_o = sym_get_const(ctx, callable);
-            if (callable_o && Py_IS_TYPE(callable_o, &PyMethodDescr_Type)
-                && sym_is_not_null(self_or_null)) {
-                PyMethodDescrObject *method = (PyMethodDescrObject *)callable_o;
-                PyCFunction cfunc = method->d_method->ml_meth;
-                ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS_INLINE, oparg, (uintptr_t)cfunc);
-            }
-            callable = sym_new_not_null(ctx);
+            JitOptRef original_callable=callable;
+            callable=sym_new_not_null(ctx);
             stack_pointer[-2 - oparg] = callable;
+            uint32_t index=(uint32_t)uop_buffer_length(&ctx->out_buffer);
+            int status=_PyCrossJit_AnalyzeMethodCall(ctx,original_callable,self_or_null,args,oparg,NULL,callable,index);
+            if (status<0) { goto error; }
+            if (status>0) { ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS,oparg,0); }
+            else {
+                PyObject *callable_o=sym_get_const(ctx,original_callable);
+                if (callable_o && Py_IS_TYPE(callable_o,&PyMethodDescr_Type) && sym_is_not_null(self_or_null)) {
+                    PyMethodDescrObject *method=(PyMethodDescrObject *)callable_o;
+                    ADD_OP(_CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS_INLINE,oparg,(uintptr_t)method->d_method->ml_meth);
+                }
+            }
             break;
         }
 
@@ -5139,8 +5198,34 @@
         }
 
         case _CALL_KW_NON_PY: {
+            JitOptRef kwnames;
+            JitOptRef *args;
+            JitOptRef self_or_null;
+            JitOptRef callable;
             JitOptRef res;
-            res = sym_new_not_null(ctx);
+            kwnames = stack_pointer[-1];
+            args = &stack_pointer[-1 - oparg];
+            self_or_null = stack_pointer[-2 - oparg];
+            callable = stack_pointer[-3 - oparg];
+            res=sym_new_not_null(ctx);
+            if (oparg<=PYJIT_OPERATION_MAX_OPERANDS) {
+                CHECK_STACK_BOUNDS(-2 - oparg);
+                stack_pointer[-3 - oparg] = res;
+                stack_pointer += -2 - oparg;
+                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                uint32_t index=(uint32_t)uop_buffer_length(&ctx->out_buffer);
+                int status=0;
+                if (sym_is_null(self_or_null)) {
+                    status=_PyCrossJit_AnalyzeCallKw(ctx,callable,args,oparg,kwnames,res,index); }
+                else {
+                    PyObject *names=_Py_uop_sym_get_probable_value(kwnames);
+                    if (names) {
+                        status=_PyCrossJit_AnalyzeMethodCall(ctx,callable,self_or_null,args,oparg,names,res,index); }
+                }
+                if (status<0) { goto error; }
+                if (status>0) { ADD_OP(_CALL_KW_NON_PY,oparg,0); }
+                stack_pointer += 2 + oparg;
+            }
             CHECK_STACK_BOUNDS(-2 - oparg);
             stack_pointer[-3 - oparg] = res;
             stack_pointer += -2 - oparg;
@@ -5338,6 +5423,15 @@
                 ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
                 break;
             }
+            CrossJitRecognition crossjit_recognition;
+            CHECK_STACK_BOUNDS(-2);
+            stack_pointer += -2;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            int crossjit_recognized = _PyCrossJit_RecognizeBinary(
+                ctx, oparg, lhs, rhs, &crossjit_recognition);
+            if (crossjit_recognized < 0) {
+                goto error;
+            }
             bool lhs_int = sym_matches_type(lhs, &PyLong_Type);
             bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
             bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
@@ -5347,7 +5441,14 @@
             bool is_remainder = (oparg == NB_REMAINDER
                              || oparg == NB_INPLACE_REMAINDER);
             int emit_op = _BINARY_OP;
-            if (is_truediv || is_remainder) {
+            if (crossjit_recognized && (is_truediv || is_remainder)) {
+                _PyCrossJit_RecordSuppressedSpeculation(
+                    (!sym_has_type(rhs) &&
+                        sym_get_probable_type(rhs) == &PyFloat_Type) +
+                    (!sym_has_type(lhs) &&
+                        sym_get_probable_type(lhs) == &PyFloat_Type));
+            }
+            if (!crossjit_recognized && (is_truediv || is_remainder)) {
                 if (!sym_has_type(rhs)
                     && sym_get_probable_type(rhs) == &PyFloat_Type) {
                     ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
@@ -5409,12 +5510,32 @@
             else {
                 res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
             }
+            CHECK_STACK_BOUNDS(3);
+            stack_pointer[0] = res;
+            stack_pointer[1] = l;
+            stack_pointer[2] = r;
+            stack_pointer += 3;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            uint32_t crossjit_uop_index = (uint32_t)uop_buffer_length(&ctx->out_buffer);
+            if (crossjit_recognized && _PyCrossJit_BindBinary(
+                    ctx, oparg, lhs, rhs, res, crossjit_uop_index,
+                    &crossjit_recognition) < 0) {
+                goto error;
+            }
             ADD_OP(emit_op, oparg, 0);
-            CHECK_STACK_BOUNDS(1);
-            stack_pointer[-2] = res;
-            stack_pointer[-1] = l;
-            stack_pointer[0] = r;
-            stack_pointer += 1;
+            break;
+        }
+
+        case _EXT_GUARD: {
+            break;
+        }
+
+        case _EXT_REGION_EXEC: {
+            JitOptRef res;
+            res = sym_new_not_null(ctx);
+            CHECK_STACK_BOUNDS(1 - oparg);
+            stack_pointer[-oparg] = res;
+            stack_pointer += 1 - oparg;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
             break;
         }
@@ -5812,6 +5933,154 @@
             JitOptRef func;
             func = stack_pointer[-2 - oparg];
             sym_set_recorded_value(func, (PyObject *)this_instr->operand0);
+            break;
+        }
+
+        case _RECORD_CJSELF: {
+            JitOptRef self;
+            self = stack_pointer[-1 - oparg];
+            if (this_instr->operand0) { sym_set_recorded_value(self,(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWSELF: {
+            JitOptRef self;
+            self = stack_pointer[-2 - oparg];
+            if (this_instr->operand0) { sym_set_recorded_value(self,(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJARG0: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg >= 1 && this_instr->operand0 != 0) {
+                sym_set_recorded_value(args[0], (PyObject *)this_instr->operand0);
+            }
+            break;
+        }
+
+        case _RECORD_CJARG1: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg >= 2 && this_instr->operand0 != 0) {
+                sym_set_recorded_value(args[1], (PyObject *)this_instr->operand0);
+            }
+            break;
+        }
+
+        case _RECORD_CJKWARG0: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>=1 && this_instr->operand0) { sym_set_recorded_value(args[0],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWARG1: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>=2 && this_instr->operand0) { sym_set_recorded_value(args[1],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJARG2: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg>2 && this_instr->operand0) { sym_set_recorded_value(args[2],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWARG2: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>2 && this_instr->operand0) { sym_set_recorded_value(args[2],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJARG3: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg>3 && this_instr->operand0) { sym_set_recorded_value(args[3],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWARG3: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>3 && this_instr->operand0) { sym_set_recorded_value(args[3],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJARG4: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg>4 && this_instr->operand0) { sym_set_recorded_value(args[4],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWARG4: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>4 && this_instr->operand0) { sym_set_recorded_value(args[4],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJARG5: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg>5 && this_instr->operand0) { sym_set_recorded_value(args[5],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWARG5: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>5 && this_instr->operand0) { sym_set_recorded_value(args[5],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJARG6: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg>6 && this_instr->operand0) { sym_set_recorded_value(args[6],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWARG6: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>6 && this_instr->operand0) { sym_set_recorded_value(args[6],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJARG7: {
+            JitOptRef *args;
+            args = &stack_pointer[-oparg];
+            if (oparg>7 && this_instr->operand0) { sym_set_recorded_value(args[7],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJKWARG7: {
+            JitOptRef *args;
+            args = &stack_pointer[-1 - oparg];
+            if (oparg>7 && this_instr->operand0) { sym_set_recorded_value(args[7],(PyObject *)this_instr->operand0); }
+            break;
+        }
+
+        case _RECORD_CJRIGHT: {
+            JitOptRef right;
+            right = stack_pointer[-1];
+            if (this_instr->operand0 != 0) {
+                sym_set_recorded_value(right, (PyObject *)this_instr->operand0);
+            }
+            break;
+        }
+
+        case _RECORD_CJLEFT: {
+            JitOptRef left;
+            left = stack_pointer[-2];
+            if (this_instr->operand0 != 0) {
+                sym_set_recorded_value(left, (PyObject *)this_instr->operand0);
+            }
             break;
         }
 

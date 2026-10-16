@@ -669,6 +669,19 @@ optimize_uops(
         return 0;
     }
 
+    /* The semantics-only mode measures provider analysis without changing the
+     * executable trace, which is useful for CrossJIT ablation experiments. */
+    if (ctx->crossjit != NULL && !_PyCrossJit_IsSemanticsOnly()) {
+        if (_PyCrossJit_FormRegions(
+                ctx->crossjit, ctx->out_buffer.start,
+                uop_buffer_length(&ctx->out_buffer)) < 0 ||
+            _PyCrossJit_RewriteRegions(
+                ctx->crossjit, ctx->out_buffer.start,
+                uop_buffer_length(&ctx->out_buffer)) < 0) {
+            goto error;
+        }
+    }
+
     /* Either reached the end or cannot optimize further, but there
      * would be no benefit in retrying later */
     _Py_uop_abstractcontext_fini(ctx);

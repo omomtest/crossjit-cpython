@@ -26,7 +26,7 @@ from stack import Stack, Storage
 DEFAULT_OUTPUT = ROOT / "Python/recorder_functions.c.h"
 
 # Must match MAX_RECORDED_VALUES in Include/internal/pycore_optimizer.h.
-MAX_RECORDED_VALUES = 3
+MAX_RECORDED_VALUES = 10
 
 # Map `_RECORD_*` uops to the helper that converts a raw family-recorded
 # value to the form the specialized member consumes.
